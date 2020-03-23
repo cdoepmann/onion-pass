@@ -526,6 +526,8 @@ relay_command_to_string(uint8_t command)
     case RELAY_COMMAND_EXTENDED2: return "EXTENDED2";
     case RELAY_COMMAND_PADDING_NEGOTIATE: return "PADDING_NEGOTIATE";
     case RELAY_COMMAND_PADDING_NEGOTIATED: return "PADDING_NEGOTIATED";
+    case RELAY_COMMAND_TOKEN1: return "TOKEN1";
+    case RELAY_COMMAND_TOKEN2: return "TOKEN2";
     default:
       tor_snprintf(buf, sizeof(buf), "Unrecognized relay command %u",
                    (unsigned)command);
@@ -2017,6 +2019,8 @@ connection_edge_process_relay_cell(cell_t *cell, circuit_t *circ,
     case RELAY_COMMAND_RENDEZVOUS2:
     case RELAY_COMMAND_INTRO_ESTABLISHED:
     case RELAY_COMMAND_RENDEZVOUS_ESTABLISHED:
+    case RELAY_COMMAND_TOKEN1:
+    case RELAY_COMMAND_TOKEN2:
       rend_process_relay_cell(circ, layer_hint,
                               rh.command, rh.length,
                               cell->payload+RELAY_HEADER_SIZE);

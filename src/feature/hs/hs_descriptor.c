@@ -68,6 +68,7 @@
 #include "feature/nodelist/torcert.h" /* tor_cert_encode_ed22519() */
 #include "lib/memarea/memarea.h"
 #include "lib/crypt_ops/crypto_format.h"
+#include "core/crypto/hs_dos_crypto.h"
 
 #include "core/or/extend_info_st.h"
 
@@ -83,6 +84,14 @@
 #define str_create2_formats "create2-formats"
 #define str_intro_auth_required "intro-auth-required"
 #define str_single_onion "single-onion-service"
+
+#define str_hs_dos_defenses_enabled "hs-dos-defenses"
+#define str_hs_dos_max_token_num "hs-dos-max-token-num"
+#define str_hs_dos_dleq_generator "hs-dos-dleq-generator"
+#define str_hs_dos_dleq_pub_key "hs-dos-dleq-pub-key"
+#define str_hs_dos_previous_dleq_generator "hs-dos-previous-dleq-generator"
+#define str_hs_dos_previous_dleq_pub_key "hs-dos-previous-dleq-pub-key"
+
 #define str_intro_point "introduction-point"
 #define str_ip_onion_key "onion-key"
 #define str_ip_auth_key "auth-key"
@@ -137,6 +146,14 @@ static token_rule_t hs_desc_encrypted_v3_token_table[] = {
   T1_START(str_create2_formats, R3_CREATE2_FORMATS, CONCAT_ARGS, NO_OBJ),
   T01(str_intro_auth_required, R3_INTRO_AUTH_REQUIRED, ARGS, NO_OBJ),
   T01(str_single_onion, R3_SINGLE_ONION_SERVICE, ARGS, NO_OBJ),
+  T01(str_hs_dos_defenses_enabled, R3_HS_DOS_DEFENSES, ARGS, OBJ_OK),
+  T01(str_hs_dos_max_token_num, R3_HS_DOS_TOKEN_NUMBER, ARGS, OBJ_OK),
+  T01(str_hs_dos_dleq_generator, R3_HS_DOS_DLEQ_GENERATOR, ARGS, OBJ_OK),
+  T01(str_hs_dos_dleq_pub_key, R3_HS_DOS_DLEQ_PUBLIC_KEY, ARGS, OBJ_OK),
+  T01(str_hs_dos_previous_dleq_generator,
+      R3_HS_DOS_DLEQ_PREVIOUS_GENERATOR, ARGS, OBJ_OK),
+  T01(str_hs_dos_previous_dleq_pub_key,
+      R3_HS_DOS_DLEQ_PREVIOUS_PUBLIC_KEY, ARGS, OBJ_OK),
   END_OF_TABLE
 };
 
@@ -741,6 +758,9 @@ static char *
 get_inner_encrypted_layer_plaintext(const hs_descriptor_t *desc)
 {
   char *encoded_str = NULL;
+  hs_desc_dos_defense_t *defenses;
+  char endoded_generator[HS_DOS_B64_P_LEN];
+  char encoded_pub_key[HS_DOS_B64_P_LEN];
   smartlist_t *lines = smartlist_new();
 
   /* Build the start of the section prior to the introduction points. */
@@ -763,6 +783,66 @@ get_inner_encrypted_layer_plaintext(const hs_descriptor_t *desc)
 
     if (desc->encrypted_data.single_onion_service) {
       smartlist_add_asprintf(lines, "%s\n", str_single_onion);
+    }
+
+    /* encode the hs_dos_defenses descriptor, if enabled */
+    if (desc->encrypted_data.hs_dos_defenses_enabled) {
+      smartlist_add_asprintf(lines, "%s\n", str_hs_dos_defenses_enabled);
+      if (!desc->encrypted_data.hs_dos_defenses){
+        log_err(LD_BUG, "HS dos defenses does not have descriptor info.");
+        goto err;
+      }
+      defenses = desc->encrypted_data.hs_dos_defenses;
+      if (defenses->hs_dos_max_token_number){
+        smartlist_add_asprintf(lines, "%s %u\n", str_hs_dos_max_token_num, 
+          defenses->hs_dos_max_token_number);
+      }
+      /* use default value as backup for max token number*/
+      else{
+        smartlist_add_asprintf(lines, "%s %u\n", str_hs_dos_max_token_num, 
+          HS_CONFIG_V3_HS_DOS_DEFENSE_TOKEN_NUMBER_DEFAULT);
+      }
+      /* generator and current public key must be available */
+      if (!defenses->dleq_generator){
+        log_err(LD_BUG, "HS dos defenses does not have a valid generator.");
+        goto err;
+      }
+      if (!defenses->dleq_public_key){
+        log_err(LD_BUG, "HS dos defenses does not have a valid public key.");
+        goto err;
+      }
+      if (hs_dos_b64_encode_point(endoded_generator,
+                              (const EC_POINT*)defenses->dleq_generator)<1){
+                                goto err;
+      }
+      if (hs_dos_b64_encode_point(encoded_pub_key,
+                              (const EC_POINT*)defenses->dleq_public_key)<1){
+                                goto err;
+      }
+      smartlist_add_asprintf(lines, "%s %s\n", 
+                             str_hs_dos_dleq_generator, endoded_generator);
+      smartlist_add_asprintf(lines, "%s %s\n", 
+                             str_hs_dos_dleq_pub_key, encoded_pub_key);
+      /* previous generator and public key are optional */
+      if (defenses->previous_dleq_public_key && defenses->previous_generator ){
+        if (hs_dos_b64_encode_point(endoded_generator,
+           (const EC_POINT*)defenses->previous_generator)<1){
+             goto err;
+        }
+        if (hs_dos_b64_encode_point(encoded_pub_key,
+           (const EC_POINT*)defenses->previous_dleq_public_key)<1){
+             goto err;
+        }
+        smartlist_add_asprintf(lines, "%s %s\n", 
+                              str_hs_dos_previous_dleq_generator,
+                              endoded_generator);
+        smartlist_add_asprintf(lines, "%s %s\n", 
+                              str_hs_dos_previous_dleq_pub_key,
+                              encoded_pub_key);
+      }
+      else{
+        log_info(LD_REND, "HS dos defenses does not have previous DLEQ proof");
+      }
     }
   }
 
@@ -1017,7 +1097,7 @@ desc_encode_v3(const hs_descriptor_t *desc,
   tor_assert(signing_kp);
   tor_assert(encoded_out);
   tor_assert(desc->plaintext_data.version == 3);
-
+  
   if (BUG(desc->subcredential == NULL)) {
     goto err;
   }
@@ -1200,6 +1280,96 @@ decode_link_specifiers(const char *encoded)
   tor_free(decoded);
   return results;
 }
+
+/**
+ * Given a number, store it in def.
+ * Return 0 on success, -1 on failure. */
+static int
+decode_token_number(hs_desc_dos_defense_t *def, const char *number)
+{
+  int ok = 0;
+  tor_assert(def);
+  tor_assert(number);
+  def->hs_dos_max_token_number = (unsigned int) tor_parse_uint64(number,
+                                  10,
+                                  HS_CONFIG_V3_HS_DOS_DEFENSE_TOKEN_NUMBER_MIN,
+                                  HS_CONFIG_V3_HS_DOS_DEFENSE_TOKEN_NUMBER_MAX,
+                                  &ok,
+                                  NULL);
+  if (!ok)
+    return -1;
+  return 0;
+};
+
+/**
+ * Given a token witth a DLEQ EC_POINT, store it in def.
+ * Return 0 on success, -1 on failure. */
+static int
+decode_dleq_point(hs_desc_dos_defense_t *def, directory_token_t *tok)
+{
+  /** TODO: get rid of this hack to suppres compiler warnings
+   * for unhandled enums. */
+  int supp_warn = (int) tok->tp;
+  tor_assert(def);
+  tor_assert(tok);
+  switch (supp_warn){
+    case R3_HS_DOS_DLEQ_GENERATOR:
+      tor_assert(def->dleq_generator);
+      if (hs_dos_b64_decode_point(def->dleq_generator, tok->args[0]))
+        return -1;
+      break;
+    case R3_HS_DOS_DLEQ_PUBLIC_KEY:
+      tor_assert(def->dleq_public_key);
+      if (hs_dos_b64_decode_point(def->dleq_public_key, tok->args[0]))
+        return -1;
+      break;
+    case R3_HS_DOS_DLEQ_PREVIOUS_GENERATOR:
+      tor_assert(def->previous_generator);
+      if (hs_dos_b64_decode_point(def->previous_generator, tok->args[0]))
+        return -1;
+      break;
+    case R3_HS_DOS_DLEQ_PREVIOUS_PUBLIC_KEY:
+      tor_assert(def->previous_dleq_public_key);
+      if (hs_dos_b64_decode_point(def->previous_dleq_public_key, tok->args[0]))
+        return -1;
+      break;
+    /* We do not have a valid keyword to decode a point */
+    default:
+      return -1;
+  }
+  return 0;
+};
+
+/**
+ * Given a defenses object, validate its values.
+ * Return 0 on success, -1 on failure. */
+static int
+validate_dos_defenses(hs_desc_dos_defense_t *def)
+{
+  tor_assert(def);
+  if (def->hs_dos_max_token_number
+      < HS_CONFIG_V3_HS_DOS_DEFENSE_TOKEN_NUMBER_MIN)
+    return -1;
+  if (def->hs_dos_max_token_number
+      > HS_CONFIG_V3_HS_DOS_DEFENSE_TOKEN_NUMBER_MAX)
+    return -1;
+  if (!def->dleq_generator || hs_dos_validate_point(def->dleq_generator))
+    return -1;
+  if (!def->dleq_public_key || hs_dos_validate_point(def->dleq_public_key))
+    return -1;
+  if (def->previous_generator){
+    if (hs_dos_validate_point(def->previous_generator))
+      return -1;
+    if (!def->previous_dleq_public_key
+        || hs_dos_validate_point(def->previous_dleq_public_key)){
+      return -1;
+    }
+  }
+  else if (def->previous_dleq_public_key){
+    return -1;
+  }
+  return 0;
+};
 
 /* Given a list of authentication types, decode it and put it in the encrypted
  * data section. Return 1 if we at least know one of the type or 0 if we know
@@ -2260,7 +2430,7 @@ desc_decode_encrypted_v3(const hs_descriptor_t *desc,
   memarea_t *area = NULL;
   directory_token_t *tok;
   smartlist_t *tokens = NULL;
-
+  hs_desc_dos_defense_t *defenses;
   tor_assert(desc);
   tor_assert(desc_encrypted_out);
 
@@ -2320,6 +2490,72 @@ desc_decode_encrypted_v3(const hs_descriptor_t *desc,
   tok = find_opt_by_keyword(tokens, R3_SINGLE_ONION_SERVICE);
   if (tok) {
     desc_encrypted_out->single_onion_service = 1;
+  }
+
+  /* Are HS DOS Defenses enabled? 
+   * This should be extracted to its own function. */
+  tok = find_opt_by_keyword(tokens, R3_HS_DOS_DEFENSES);
+  if (tok) {
+    desc_encrypted_out->hs_dos_defenses_enabled = 1;
+    /* Make sure we allocate memory for the defenses */
+    hs_desc_dos_defense_t_free(desc_encrypted_out->hs_dos_defenses);
+    desc_encrypted_out->hs_dos_defenses = hs_desc_dos_defense_t_new();
+    defenses = desc_encrypted_out->hs_dos_defenses;
+    tok = find_opt_by_keyword(tokens, R3_HS_DOS_TOKEN_NUMBER);
+    if (tok) {
+      if (decode_token_number(defenses, tok->args[0])) {
+        log_warn(LD_REND, "Service descriptor HS DOS defenses has "
+                          "invalid entry(ies).");
+        goto err;
+      }
+    }
+    tok = find_opt_by_keyword(tokens, R3_HS_DOS_DLEQ_GENERATOR);
+    if (!tok){
+      log_warn(LD_REND, "Service descriptor HS DOS defenses has "
+                        "invalid entry(ies).");
+      goto err;
+    }
+    if (decode_dleq_point(defenses, tok)) {
+      log_warn(LD_REND, "Service descriptor HS DOS defenses has "
+                        "invalid entry(ies).");
+      goto err;
+    }
+    tok = find_opt_by_keyword(tokens, R3_HS_DOS_DLEQ_PUBLIC_KEY);
+    if (!tok){
+      log_warn(LD_REND, "Service descriptor HS DOS defenses has "
+                        "invalid entry(ies).");
+      goto err;
+    }
+    if (decode_dleq_point(defenses, tok)) {
+      log_warn(LD_REND, "Service descriptor HS DOS defenses has "
+                        "invalid entry(ies).");
+      goto err;
+    }
+    tok = find_opt_by_keyword(tokens, R3_HS_DOS_DLEQ_PREVIOUS_GENERATOR);
+    if (!tok){
+      log_warn(LD_REND, "Service descriptor HS DOS defenses has "
+                        "invalid entry(ies).");
+      goto err;
+    }
+    if (decode_dleq_point(defenses, tok)) {
+      log_warn(LD_REND, "Service descriptor HS DOS defenses has "
+                        "invalid entry(ies).");
+      goto err;
+    }
+    tok = find_opt_by_keyword(tokens, R3_HS_DOS_DLEQ_PREVIOUS_PUBLIC_KEY);
+    if (!tok){
+      log_warn(LD_REND, "Service descriptor HS DOS defenses has "
+                        "invalid entry(ies).");
+      goto err;
+    }
+    if (decode_dleq_point(defenses, tok)) {
+      log_warn(LD_REND, "Service descriptor HS DOS defenses has "
+                        "invalid entry(ies).");
+      goto err;
+    }
+    /* Make sure the defenses object is fine */
+    if (validate_dos_defenses(defenses))
+      goto err;
   }
 
   /* Initialize the descriptor's introduction point list before we start
@@ -2656,7 +2892,7 @@ hs_desc_encode_descriptor,(const hs_descriptor_t *desc,
    * never happened else we forgot to add it but we bumped the version. */
   tor_assert(ARRAY_LENGTH(encode_handlers) >= version);
   tor_assert(encode_handlers[version]);
-
+  
   ret = encode_handlers[version](desc, signing_kp,
                                  descriptor_cookie, encoded_out);
   if (ret < 0) {
@@ -2734,6 +2970,7 @@ hs_desc_encrypted_data_free_contents(hs_desc_encrypted_data_t *desc)
                       hs_desc_intro_point_free(ip));
     smartlist_free(desc->intro_points);
   }
+  hs_desc_dos_defense_t_free(desc->hs_dos_defenses);
   memwipe(desc, 0, sizeof(*desc));
 }
 
@@ -2774,6 +3011,42 @@ hs_descriptor_free_(hs_descriptor_t *desc)
   hs_desc_encrypted_data_free_contents(&desc->encrypted_data);
   tor_free(desc);
 }
+
+/**
+ * Create hs_desc_dos_defense_t struct and allocate memory for members
+ * Return pointer. */
+hs_desc_dos_defense_t *hs_desc_dos_defense_t_new(void)
+{
+  hs_desc_dos_defense_t *d = tor_malloc(sizeof(hs_desc_dos_defense_t));
+  const EC_GROUP *ec = hs_dos_get_group();
+  d->dleq_generator = EC_POINT_new(ec);
+  tor_assert(d->dleq_generator);
+  d->dleq_public_key = EC_POINT_new(ec);
+  tor_assert(d->dleq_public_key);
+  d->previous_dleq_public_key = EC_POINT_new(ec);
+  tor_assert(d->previous_dleq_public_key);
+  d->previous_generator = EC_POINT_new(ec);
+  tor_assert(d->previous_generator);
+  return d;
+};
+
+/** 
+ * Free hs_desc_dos_defense_t structs including all members.
+ * Set to NULL. */
+void hs_desc_dos_defense_t_free(hs_desc_dos_defense_t *d)
+{
+  if (d == NULL)
+    return;
+  EC_POINT_free(d->dleq_generator);
+  d->dleq_generator = NULL;
+  EC_POINT_free(d->dleq_public_key);
+  d->dleq_public_key = NULL;
+  EC_POINT_free(d->previous_dleq_public_key);
+  d->previous_dleq_public_key = NULL;
+  EC_POINT_free(d->previous_generator);
+  d->previous_generator = NULL;
+  tor_free(d);
+};
 
 /* Return the size in bytes of the given plaintext data object. A sizeof() is
  * not enough because the object contains pointers and the encrypted blob.

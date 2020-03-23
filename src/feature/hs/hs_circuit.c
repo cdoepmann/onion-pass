@@ -30,6 +30,9 @@
 #include "lib/crypt_ops/crypto_rand.h"
 #include "lib/crypt_ops/crypto_util.h"
 
+#include "feature/hs/hs_dos.h"
+#include "trunnel/hs/cell_token.h"
+
 /* Trunnel. */
 #include "trunnel/ed25519_cert.h"
 #include "trunnel/hs/cell_common.h"
@@ -39,6 +42,169 @@
 #include "core/or/crypt_path_st.h"
 #include "feature/nodelist/node_st.h"
 #include "core/or/origin_circuit_st.h"
+
+/* Unsets and frees all variables stored in circ, related to a request
+ * or receipt of hs dos tokens */
+void unset_token_request(origin_circuit_t *circ)
+{
+  tor_assert(circ);
+  circ->token1_cells_sent = 0;
+  circ->token1_cells_initiated = 0;
+  circ->token2_cells_initiated = 0;
+  circ->cur_size = 0;
+  hs_dos_tokens_free(circ->client_token, circ->batch_size);
+  if (circ->service_token){
+    SMARTLIST_FOREACH(circ->service_token,
+                      hs_dos_sig_token_t*,
+                      sig_tok,
+                      hs_dos_sig_token_t_free(sig_tok));
+  }
+  smartlist_free(circ->service_token);
+  hs_dos_proof_t_free(circ->dleq_proof);
+  if (circ->dleq_pk){
+    EC_POINT_free(circ->dleq_pk);
+    circ->dleq_pk = NULL;
+  }
+  circ->batch_size = 0;
+};
+
+/* Build and send the token1 cells
+ * Return 0 on success, -1 on failure */
+int hs_circ_send_token1_cells(origin_circuit_t *rdv_circ,
+                              uint8_t pow_len,
+                              const uint8_t *pow)
+{
+  int ret = -1;
+  ssize_t payload_len;
+  ssize_t token_len;
+  uint8_t payload[RELAY_PAYLOAD_SIZE] = {0};
+  trn_cell_token1_t *cell;
+  trn_cell_extension_t *ext;
+  trn_hs_pow_t *hs_pow;
+  trn_hs_token_t *cur_token = NULL;
+  hs_dos_token_t **client_token;
+  int batch_size;
+  unsigned char encoded_token[HS_DOS_EC_POINT_LEN];
+
+  client_token = rdv_circ->client_token;
+  batch_size = rdv_circ->batch_size;
+
+  tor_assert(rdv_circ);
+  tor_assert(rdv_circ->hs_ident);
+  tor_assert(client_token);
+  tor_assert(batch_size>0);
+  if (pow_len>0)
+    tor_assert(pow);
+
+  cell = trn_cell_token1_new();
+  tor_assert(cell);
+  hs_pow = trn_hs_pow_new();
+  tor_assert(hs_pow);
+  ext = trn_cell_extension_new();
+  tor_assert(ext);
+  /* Set extension data. None are used. */
+  trn_cell_extension_set_num(ext, 0);
+  trn_cell_token1_set_extensions(cell, ext);
+  trn_cell_token1_set_last_cell(cell, 0);
+  trn_cell_token1_set_token_num(cell, 0);
+  trn_cell_token1_setlen_tokens(cell, 0);
+  trn_cell_token1_setlen_pow(cell, 1);
+  trn_cell_token1_setlen_batch_size(cell, 1);
+  trn_cell_token1_set_first_cell(cell, 1);
+  trn_cell_token1_set_batch_size(cell, 0, batch_size);
+  trn_hs_pow_set_pow_len(hs_pow, pow_len);
+  memcpy(trn_hs_pow_getarray_proof_of_work(hs_pow), pow, pow_len);
+  trn_cell_token1_set_pow(cell, 0, hs_pow);
+
+  for (uint8_t seq=0; seq<batch_size; seq++){
+
+    tor_assert(client_token[seq]);
+    tor_assert(client_token[seq]->blind_token);
+
+    cur_token = trn_hs_token_new();
+    tor_assert(cur_token);
+
+    trn_hs_token_set_seq_num(cur_token, seq);
+    client_token[seq]->seq_num = seq;
+    if (hs_dos_encode_ec_point(encoded_token, client_token[seq]->blind_token))
+      goto end;
+    memcpy(trn_hs_token_getarray_token(cur_token),
+           encoded_token,
+           HS_DOS_EC_POINT_LEN);
+    payload_len = trn_cell_token1_encoded_len(cell);
+    token_len = trn_hs_token_encoded_len(cur_token);
+    if (payload_len<0 || token_len<0){
+      goto end;
+    }
+    /* TODO: properly handle the case where this is not true
+     * It should only be possible in the first iteration of the loop
+     * Currently the first token simply will not be used */
+    if (payload_len+token_len<=RELAY_PAYLOAD_SIZE){
+      trn_cell_token1_set_token_num(cell,
+                                    trn_cell_token1_get_token_num(cell)+1);
+      trn_cell_token1_add_tokens(cell, cur_token);
+      cur_token = NULL;
+    }
+    else{
+      log_warn(LD_BUG, "Unable to add token (%u of %d)"
+                       "to TOKEN1 cell on circuit %u.",
+                        seq,
+                        batch_size,
+                        TO_CIRCUIT(rdv_circ)->n_circ_id);
+      goto end;
+    }
+
+    /* This is the last cell we are building */
+    if (seq==batch_size-1){
+      trn_cell_token1_set_last_cell(cell, 1);
+    }
+
+    /* This cell is either full or the last one so we can send it */
+    if(seq==batch_size-1 || payload_len+(2*token_len)>RELAY_PAYLOAD_SIZE){
+      payload_len = trn_cell_token1_encode(payload, RELAY_PAYLOAD_SIZE, cell);
+      if (relay_send_command_from_edge(CONTROL_CELL_ID, TO_CIRCUIT(rdv_circ),
+                                      RELAY_COMMAND_TOKEN1,
+                                      (const char *) payload, payload_len,
+                                      rdv_circ->cpath->prev) < 0) {
+        /* On error, circuit is closed. */
+        log_warn(LD_REND, "Unable to send TOKEN1 cell on circuit %u.",
+                TO_CIRCUIT(rdv_circ)->n_circ_id);
+        goto end;
+      }
+      /* Make the loop continue and prepare another cell
+       * unset cell etc*/
+      if(seq!=batch_size-1){
+        payload_len = 0;
+        memset(payload, 0, RELAY_PAYLOAD_SIZE);
+        if (cur_token){
+          trn_hs_token_free(cur_token);
+          cur_token = NULL;
+        }
+        trn_cell_token1_setlen_tokens(cell, 0);
+        trn_cell_token1_setlen_pow(cell, 0);
+        hs_pow = NULL;
+        trn_cell_token1_setlen_batch_size(cell, 0);
+        trn_cell_token1_set_last_cell(cell, 0);
+        trn_cell_token1_set_first_cell(cell, 0);
+        trn_cell_token1_set_token_num(cell, 0);
+      }
+    }
+  }
+
+  /* Success */
+  ret = 0;
+
+  end:
+    if (cur_token){
+      trn_hs_token_free(cur_token);
+      cur_token = NULL;
+    }
+    trn_cell_token1_setlen_tokens(cell, 0);
+    trn_cell_token1_setlen_pow(cell, 0);
+    trn_cell_token1_setlen_batch_size(cell, 0);
+    trn_cell_token1_free(cell);
+    return ret;
+};
 
 /* A circuit is about to become an e2e rendezvous circuit. Check
  * <b>circ_purpose</b> and ensure that it's properly set. Return true iff
@@ -582,15 +748,21 @@ static int
 setup_introduce1_data(const hs_desc_intro_point_t *ip,
                       const node_t *rp_node,
                       const uint8_t *subcredential,
+                      const ed25519_public_key_t *identity_pk,
+                      const EC_POINT *dleq_pk,
+                      const hs_dos_storable_token_t *tok,
                       hs_cell_introduce1_data_t *intro1_data)
 {
   int ret = -1;
   smartlist_t *rp_lspecs;
+  char rq_binding_data[HS_SERVICE_ADDR_LEN_BASE32+1];
 
   tor_assert(ip);
   tor_assert(rp_node);
   tor_assert(subcredential);
   tor_assert(intro1_data);
+
+  intro1_data->hs_dos_token = 0;
 
   /* Build the link specifiers from the node at the end of the rendezvous
    * circuit that we opened for this introduction. */
@@ -615,6 +787,25 @@ setup_introduce1_data(const hs_desc_intro_point_t *ip,
   if (intro1_data->onion_pk == NULL) {
     /* We can't rendezvous without the curve25519 onion key. */
     goto end;
+  }
+  /* Add the token data if available */
+  if (dleq_pk && tok && identity_pk){
+    hs_build_address(identity_pk, HS_VERSION_THREE, rq_binding_data);
+    if (hs_dos_prepare_redemption(intro1_data->redemption_hmac,
+                              tok->token_rn,
+                              tok->signature,
+                              rq_binding_data,
+                              HS_SERVICE_ADDR_LEN_BASE32+1)){
+      goto end;
+    }
+    if (hs_dos_encode_bn(intro1_data->token_rn, tok->token_rn)){
+      goto end;
+    }
+    if (hs_dos_encode_ec_point(intro1_data->dleq_pk, dleq_pk)){
+      goto end;
+    }
+    /* Everything went fine, we have a token to spend */
+    intro1_data->hs_dos_token = 1;
   }
   /* Success, we have valid introduce data. */
   ret = 0;
@@ -928,7 +1119,7 @@ hs_circ_handle_intro_established(const hs_service_t *service,
  * circuit and service. This cell is associated with the intro point object ip
  * and the subcredential. Return 0 on success else a negative value. */
 int
-hs_circ_handle_introduce2(const hs_service_t *service,
+hs_circ_handle_introduce2(hs_service_t *service,
                           const origin_circuit_t *circ,
                           hs_service_intro_point_t *ip,
                           const uint8_t *subcredential,
@@ -953,6 +1144,8 @@ hs_circ_handle_introduce2(const hs_service_t *service,
   data.payload_len = payload_len;
   data.link_specifiers = smartlist_new();
   data.replay_cache = ip->replay_cache;
+  data.dleq_pk = NULL;
+  data.token_rn = NULL;
 
   if (hs_cell_parse_introduce2(&data, circ, service) < 0) {
     goto done;
@@ -979,13 +1172,235 @@ hs_circ_handle_introduce2(const hs_service_t *service,
    * so increment our counter that we've seen one on this intro point. */
   ip->introduce2_count++;
 
+  /* Before sending, lets make sure this cell can be sent on the service
+   * circuit asking the DoS defenses. */
+  if (!hs_dos_can_launch_rendezvous(service,
+                                    data.dleq_pk,
+                                    data.token_rn,
+                                    data.redemption_hmac)){
+    char *msg;
+    static ratelim_t rlimit = RATELIM_INIT(5 * 60);
+    if ((msg = rate_limit_log(&rlimit, approx_time()))) {
+      log_info(LD_REND, "Can't launch v3 rendezvous circuit due to DoS "
+                            "limitations. Ignoring INTRO2 cell");
+      tor_free(msg);
+    }
+    goto done;
+  }
+
   /* Launch rendezvous circuit with the onion key and rend cookie. */
   launch_rendezvous_point_circuit(service, ip, &data);
   /* Success. */
   ret = 0;
+  
+ done:
+  if (data.dleq_pk){
+    EC_POINT_free(data.dleq_pk);
+  }
+  if (data.token_rn){
+    BN_free(data.token_rn);
+  }
+  link_specifier_smartlist_free(data.link_specifiers);
+  memwipe(&data, 0, sizeof(data));
+  return ret;
+}
+
+/* Return 0 if cell is valid for current service and circuit state
+ * 1 if not, -1 on error */
+static int
+validate_token1_cell(const hs_service_t *service,
+                     origin_circuit_t *circ,
+                     hs_cell_token1_data_t *data)
+{
+  tor_assert(service);
+  tor_assert(circ);
+  tor_assert(data);
+  /* TODO Perform the check on the proof of work */
+  if (data->is_first && (data->batch_size > service->config.hs_dos_token_num ||
+                         circ->token1_cells_initiated ||
+                         data->token_num > data->batch_size)){
+    return 1;
+  }
+  else if (!data->is_first && (data->token_num+circ->service_token->num_used >
+                                                          circ->batch_size ||
+                               !circ->token1_cells_initiated)){
+    return 1;
+  }
+  else{
+    return 0;
+  }
+};
+
+/* Will send the TOKEN2 cells, for which the relevant data should be held
+ * in the service and circ.
+ * It will free and unset all token request data stored in circ.  */
+static void hs_dos_send_token2_cells(const hs_service_t *service,
+                                     origin_circuit_t *circ)
+{
+  hs_dos_sig_token_t **tokens = NULL;
+  hs_dos_proof_t *proof = NULL;
+  smartlist_t *cells = NULL;
+  unsigned char encoded_proof[HS_DOS_PROOF_LEN];
+  unsigned char encoded_dleq_pk[HS_DOS_EC_POINT_LEN];
+  const hs_dos_handler_t *handler = NULL;
+  const EC_POINT *dleq_pk = NULL;
+  int idx = 0;
+
+  tor_assert(service);
+  tor_assert(circ);
+  tor_assert(circ->batch_size == circ->service_token->num_used);
+
+  handler = (const hs_dos_handler_t*) service->cur_handler;
+  tor_assert(handler);
+
+  cells = smartlist_new();
+  tor_assert(cells);
+
+  tokens = tor_malloc(sizeof(hs_dos_sig_token_t*) * circ->batch_size);
+  proof = hs_dos_proof_t_new();
+
+  SMARTLIST_FOREACH_BEGIN(circ->service_token, hs_dos_sig_token_t*, t){
+    tokens[idx] = t;
+    idx++;
+  } SMARTLIST_FOREACH_END(t);
+
+  if (hs_dos_sign_n_tokens(proof, tokens, circ->batch_size, handler)){
+    goto end;
+  }
+  if (hs_dos_encode_proof(encoded_proof, proof))
+    goto end;
+  
+  dleq_pk = EC_KEY_get0_public_key(handler->hs_dos_oprf_key);
+  tor_assert(dleq_pk);
+
+  if (hs_dos_encode_ec_point(encoded_dleq_pk, dleq_pk))
+    goto end;
+
+  if (hs_cell_build_token2_cells(cells,
+                                 circ->batch_size,
+                                 (uint8_t*) encoded_dleq_pk,
+                                 (uint8_t*) encoded_proof,
+                                 tokens)){
+    goto end;
+  }
+
+  /* Send cells and free them! */
+  SMARTLIST_FOREACH_BEGIN(cells, hs_cell_token2_data_t*, data){
+    /* This indicates an error */
+    if (data->payload_len <= 0){
+      log_warn(LD_REND, "Unable to send TOKEN1 cell on circuit %u.",
+                TO_CIRCUIT(circ)->n_circ_id);
+      goto end;
+    }
+    else{
+      if (relay_send_command_from_edge(CONTROL_CELL_ID, TO_CIRCUIT(circ),
+                            RELAY_COMMAND_TOKEN2,
+                            (const char *) data->payload, data->payload_len,
+                            circ->cpath->prev) < 0) {
+        /* On error, circuit is closed. */
+        log_warn(LD_REND, "Unable to send TOKEN1 cell on circuit %u.",
+                TO_CIRCUIT(circ)->n_circ_id);
+        goto end;
+      }
+    }
+  }SMARTLIST_FOREACH_END(data);
+
+  
+  end:
+    if (cells){
+      SMARTLIST_FOREACH(cells,
+                        hs_cell_token2_data_t*,
+                        t2_data,
+                        hs_cell_token2_data_free(t2_data));
+      smartlist_free(cells);
+    }
+    unset_token_request(circ);
+    tor_free(tokens);
+    hs_dos_proof_t_free(proof);
+};
+
+/* We just received a TOKEN1 cell on the established rendezvous circuit
+ * circ.  Handle the TOKEN1 payload of size payload_len for the given
+ * circuit and service. Return 0 on success else a negative value. */
+int
+hs_circ_handle_token1(const hs_service_t *service,
+                      origin_circuit_t *circ,
+                      const uint8_t *payload,
+                      size_t payload_len)
+{
+  int ret = -1;
+  hs_cell_token1_data_t data;
+
+  tor_assert(service);
+  tor_assert(circ);
+  tor_assert(payload);
+
+  if (!service->config.hs_dos_defense_enabled){
+    goto done;
+  }
+  if (!service->cur_handler){
+    goto done;
+  }
+  memset(&data, 0, sizeof(hs_cell_token1_data_t));
+
+  /* Populate the data structure with everything we need for the cell to be
+   * parsed, decrypted and key material computed correctly. */
+  data.payload = payload;
+  data.payload_len = payload_len;
+
+  if (hs_cell_parse_token1(&data, circ, service) < 0) {
+    goto done;
+  }
+
+  /* This should not happen, we close the circuit */
+  if (validate_token1_cell(service, circ, &data)){
+    log_warn(LD_REND,
+           "Closing RENDEZVOUS circuit. TOKEN1 cell invalid. %s",
+           service->onion_address);
+    circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_REASON_INTERNAL);
+    goto done;
+  }
+  /* We have a new request */
+  if (data.is_first){
+    circ->batch_size = data.batch_size;
+    circ->service_token = smartlist_new();
+    tor_assert(data.tokens);
+    smartlist_add_all(circ->service_token, data.tokens);
+    circ->token1_cells_initiated = 1;
+  }
+  else{ /* This belongs to an existing request */
+    tor_assert(circ->service_token);
+    tor_assert(data.tokens);
+    smartlist_add_all(circ->service_token, data.tokens);
+  }
+  /* Request is complete, we can handle it */
+  if (data.is_last){
+    if (circ->batch_size != circ->service_token->num_used){
+      log_warn(LD_REND, "Closing circuit."
+               "Received an incorrect number of TOKEN1 requests %s",
+               service->onion_address);
+      circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_REASON_INTERNAL);
+      goto done;
+    }
+    printf("Parsed TOKEN1 cells\n");
+    hs_dos_send_token2_cells(service, circ);
+  }
+
+  /* Success. */
+  ret = 0;
 
  done:
-  link_specifier_smartlist_free(data.link_specifiers);
+  /* We do not free the content of the data.tokens, as we might either need it
+   * or should have freed it earlier */
+  if (ret && data.tokens){
+    SMARTLIST_FOREACH(data.tokens,
+                      hs_dos_sig_token_t*,
+                      sig_tok,
+                      hs_dos_sig_token_t_free(sig_tok));
+  }
+  if (data.tokens)
+    smartlist_free(data.tokens);
+  tor_free(data.pow);
   memwipe(&data, 0, sizeof(data));
   return ret;
 }
@@ -1052,12 +1467,15 @@ hs_circuit_setup_e2e_rend_circ_legacy_client(origin_circuit_t *circ,
  * This will also setup the circuit identifier on rend_circ containing the key
  * material for the handshake and e2e encryption. Return 0 on success else
  * negative value. Because relay_send_command_from_edge() closes the circuit
- * on error, it is possible that intro_circ is closed on error. */
+ * on error, it is possible that intro_circ is closed on error.
+ * tok and dleq_pk are NULL if no token is available */
 int
 hs_circ_send_introduce1(origin_circuit_t *intro_circ,
                         origin_circuit_t *rend_circ,
                         const hs_desc_intro_point_t *ip,
-                        const uint8_t *subcredential)
+                        const uint8_t *subcredential,
+                        const EC_POINT *dleq_pk,
+                        const hs_dos_storable_token_t *tok)
 {
   int ret = -1;
   ssize_t payload_len;
@@ -1085,7 +1503,9 @@ hs_circ_send_introduce1(origin_circuit_t *intro_circ,
 
   /* We should never select an invalid rendezvous point in theory but if we
    * do, this function will fail to populate the introduce data. */
-  if (setup_introduce1_data(ip, exit_node, subcredential, &intro1_data) < 0) {
+  if (setup_introduce1_data(ip, exit_node, subcredential,
+                            &intro_circ->hs_ident->identity_pk,
+                            dleq_pk, tok, &intro1_data) < 0) {
     log_warn(LD_REND, "Unable to setup INTRODUCE1 data. The chosen rendezvous "
                       "point is unusable. Closing circuit.");
     goto close;

@@ -113,6 +113,32 @@ typedef struct hs_desc_intro_point_t {
   unsigned int cross_certified : 1;
 } hs_desc_intro_point_t;
 
+/* Onion service DoS defenses information located in a descriptor. */
+typedef struct hs_desc_dos_defense_t {
+  /* The latest public key of the onion service used to compute the DLEQ
+   * proof. */
+  EC_POINT *dleq_public_key;
+
+  /* The previous public key of the onion service used to compute the DLEQ
+   * proof. This will only be used to verify tokens not to issue tokens. */
+  EC_POINT *previous_dleq_public_key;
+
+  /* The generator of the latest public key of the onion service used to compute the DLEQ
+   * proof. */
+  EC_POINT *dleq_generator;
+
+  /* The generator of the previous public key of the onion service used to compute the DLEQ
+   * proof. */
+  EC_POINT *previous_generator;
+
+  /** TODO: Should we sign the generators and dleq public keys? */
+
+  /**
+   * Sets the maximum number of tokens a client may have signed in one batch,
+   * that means for one correct solution of a challenge (CAPTCHA/ PoW). */
+  unsigned int hs_dos_max_token_number;
+} hs_desc_dos_defense_t;
+
 /* Authorized client information located in a descriptor. */
 typedef struct hs_desc_authorized_client_t {
   /* An identifier that the client will use to identify which auth client
@@ -140,6 +166,13 @@ typedef struct hs_desc_encrypted_data_t {
 
   /* Is this descriptor a single onion service? */
   unsigned int single_onion_service : 1;
+
+  /* 1 if HS dos defenses are enabled, 0 otherwise. */
+  unsigned int hs_dos_defenses_enabled : 1;
+
+  /* Contains the relevant dleq proof data and the mx batch size
+   * of token issuing. */
+  hs_desc_dos_defense_t *hs_dos_defenses;
 
   /* A list of intro points. Contains hs_desc_intro_point_t objects. */
   smartlist_t *intro_points;
@@ -244,6 +277,9 @@ void hs_desc_encrypted_data_free_(hs_desc_encrypted_data_t *desc);
   FREE_AND_NULL(hs_desc_encrypted_data_t, hs_desc_encrypted_data_free_, (desc))
 
 void hs_descriptor_clear_intro_points(hs_descriptor_t *desc);
+
+hs_desc_dos_defense_t *hs_desc_dos_defense_t_new(void);
+void hs_desc_dos_defense_t_free(hs_desc_dos_defense_t *d);
 
 MOCK_DECL(int,
           hs_desc_encode_descriptor,(const hs_descriptor_t *desc,

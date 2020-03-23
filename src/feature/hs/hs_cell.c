@@ -23,6 +23,27 @@
 #include "trunnel/hs/cell_establish_intro.h"
 #include "trunnel/hs/cell_introduce1.h"
 #include "trunnel/hs/cell_rendezvous.h"
+#include "trunnel/hs/cell_token.h"
+
+/* Free the TOKEN2 data object and all of its members.
+ * May only be used for cells sent due to pointer type in data->tokens */
+void hs_cell_token2_data_free(hs_cell_token2_data_t *data)
+{
+  if (data==NULL)
+    return;
+  tor_free(data->payload);
+  tor_free(data->dleq_pk);
+  tor_free(data->dleq_proof);
+  if (data->tokens){
+    SMARTLIST_FOREACH(data->tokens,
+                      hs_dos_sig_token_t*,
+                      tok,
+                      hs_dos_sig_token_t_free(tok));
+    smartlist_free(data->tokens);
+  }
+  tor_free(data);
+};
+
 
 /* Compute the MAC of an INTRODUCE cell in mac_out. The encoded_cell param is
  * the cell content up to the ENCRYPTED section of length encoded_cell_len.
@@ -249,6 +270,40 @@ parse_introduce2_cell(const hs_service_t *service,
   return -1;
 }
 
+/* Parse an TOKEN1 cell from payload of size payload_len for the given
+ * service and circuit which are used only for logging purposes. The resulting
+ * parsed cell is put in cell_ptr_out.
+ *
+ * Return 0 on success else a negative value and cell_ptr_out is untouched. */
+static int
+parse_token1_cell(const hs_service_t *service,
+                  const origin_circuit_t *circ, const uint8_t *payload,
+                  size_t payload_len,
+                  trn_cell_token1_t **cell_ptr_out)
+{
+  trn_cell_token1_t *cell = NULL;
+
+  tor_assert(service);
+  tor_assert(circ);
+  tor_assert(payload);
+  tor_assert(cell_ptr_out);
+
+  /* Parse the cell so we can start cell validation. */
+  if (trn_cell_token1_parse(&cell, payload, payload_len) < 0) {
+    log_info(LD_PROTOCOL, "Unable to parse TOKEN1 cell on circuit %u "
+                          "for service %s",
+             TO_CIRCUIT(circ)->n_circ_id,
+             safe_str_client(service->onion_address));
+    goto err;
+  }
+
+  /* Success. */
+  *cell_ptr_out = cell;
+  return 0;
+ err:
+  return -1;
+}
+
 /* Set the onion public key onion_pk in cell, the encrypted section of an
  * INTRODUCE1 cell. */
 static void
@@ -394,6 +449,114 @@ introduce1_encrypt_and_encode(trn_cell_introduce1_t *cell,
   tor_free(encrypted);
 }
 
+/** Build the HS DoS defense cell extension and put it in the given extensions
+ * object. Return 0 on success, -1 on failure.  (Right now, failure is only
+ * possible if there is a bug.) */
+static int
+build_intro_encrypted_hs_dos_extension(const unsigned char *dleq_pk,
+                              const unsigned char *token,
+                              const char *redemption_hmac,
+                              trn_cell_extension_t *extensions)
+{
+  ssize_t ret;
+  size_t hs_dos_ext_encoded_len;
+  uint8_t *field_array = NULL;
+  trn_cell_extension_field_t *field = NULL;
+  trn_cell_extension_hs_dos_t *hs_dos_ext = NULL;
+
+  tor_assert(dleq_pk);
+  tor_assert(token);
+  tor_assert(redemption_hmac);
+  tor_assert(extensions);
+
+  /* We are creating a cell extension field of the type HS DoS. */
+  field = trn_cell_extension_field_new();
+  trn_cell_extension_field_set_field_type(field,
+                                          TRUNNEL_CELL_EXTENSION_TYPE_HS_DOS);
+
+  /* Build HS DoS extension field. We will put in two parameters. */
+  hs_dos_ext = trn_cell_extension_hs_dos_new();
+        
+  memcpy(trn_cell_extension_hs_dos_getarray_pub_key(hs_dos_ext),
+          dleq_pk,
+          TRUNNEL_CELL_EXTENSION_HS_DOS_DLEQ_PK_LEN);
+  
+  memcpy(trn_cell_extension_hs_dos_getarray_token(hs_dos_ext),
+          token,
+          TRUNNEL_CELL_EXTENSION_HS_DOS_TOKEN_LEN);
+
+  memcpy(trn_cell_extension_hs_dos_getarray_redemption_mac(hs_dos_ext),
+          redemption_hmac,
+          TRUNNEL_CELL_EXTENSION_HS_DOS_MAC_LEN);
+
+  /* Set the field with the encoded HS DoS extension. */
+  ret = trn_cell_extension_hs_dos_encoded_len(hs_dos_ext);
+  if (BUG(ret <= 0)) {
+    goto err;
+  }
+  hs_dos_ext_encoded_len = ret;
+  /* Set length field and the field array size length. */
+  trn_cell_extension_field_set_field_len(field, hs_dos_ext_encoded_len);
+  trn_cell_extension_field_setlen_field(field, hs_dos_ext_encoded_len);
+  /* Encode the HS DoS extension into the cell extension field. */
+  field_array = trn_cell_extension_field_getarray_field(field);
+  ret = trn_cell_extension_hs_dos_encode(field_array,
+                 trn_cell_extension_field_getlen_field(field), hs_dos_ext);
+  if (BUG(ret <= 0)) {
+    goto err;
+  }
+  tor_assert(ret == (ssize_t) hs_dos_ext_encoded_len);
+
+  /* Finally, encode field into the cell extension. */
+  trn_cell_extension_add_fields(extensions, field);
+
+  /* We've just add an extension field to the cell extensions so increment the
+   * total number. */
+  trn_cell_extension_set_num(extensions,
+                             trn_cell_extension_get_num(extensions) + 1);
+
+  /* Cleanup. DoS extension has been encoded at this point. */
+  trn_cell_extension_hs_dos_free(hs_dos_ext);
+
+  return 0;
+
+ err:
+  trn_cell_extension_field_free(field);
+  trn_cell_extension_hs_dos_free(hs_dos_ext);
+  return -1;
+}
+
+/** Allocate and build all the INTRODUCE1 cell extension. The given
+ * extensions pointer is always set to a valid cell extension object. */
+static trn_cell_extension_t *
+build_intro_encrypted_extensions(const hs_cell_introduce1_data_t *data)
+{
+  int ret;
+  trn_cell_extension_t *extensions;
+
+  tor_assert(data);
+
+  extensions = trn_cell_extension_new();
+  trn_cell_extension_set_num(extensions, 0);
+
+  /* If the defense has been enabled service side (by the operator with a
+   * torrc option) and the intro point does support it. */
+  if (data->hs_dos_token) {
+    /* This function takes care to increment the number of extensions. */
+    ret = build_intro_encrypted_hs_dos_extension(data->dleq_pk,
+                                                 data->token_rn,
+                                                 data->redemption_hmac,
+                                                 extensions);
+    if (ret < 0) {
+      /* Return no extensions on error. */
+      goto end;
+    }
+  }
+
+ end:
+  return extensions;
+}
+
 /* Using the INTRODUCE1 data, setup the ENCRYPTED section in cell. This means
  * set it, encrypt it and encode it. */
 static void
@@ -409,10 +572,9 @@ introduce1_set_encrypted(trn_cell_introduce1_t *cell,
   enc_cell = trn_cell_introduce_encrypted_new();
   tor_assert(enc_cell);
 
-  /* Set extension data. None are used. */
-  ext = trn_cell_extension_new();
+    /* Set extension data. */
+  ext = build_intro_encrypted_extensions(data);
   tor_assert(ext);
-  trn_cell_extension_set_num(ext, 0);
   trn_cell_introduce_encrypted_set_extensions(enc_cell, ext);
 
   /* Set the rendezvous cookie. */
@@ -622,6 +784,105 @@ hs_cell_parse_intro_established(const uint8_t *payload, size_t payload_len)
   return ret;
 }
 
+/* Parse hs_dos cell extension in the given INTRODUCE1 cell.
+ * Return 0 on success, -1 on failure. */
+static int
+handle_introduce_encrypted_hs_dos_cell_extension(
+                                    hs_cell_introduce2_data_t *data,
+                                    const trn_cell_extension_field_t *field)
+{
+  ssize_t ret;
+  trn_cell_extension_hs_dos_t *hs_dos = NULL;
+
+  tor_assert(field);
+  tor_assert(data);
+  memset(data->redemption_hmac, 0, HS_DOS_REDEMPTION_MAC);
+  data->dleq_pk = EC_POINT_new(hs_dos_get_group());
+  tor_assert(data->dleq_pk);
+  data->token_rn = BN_new();
+  tor_assert(data->token_rn);
+
+
+  ret = trn_cell_extension_hs_dos_parse(&hs_dos,
+                 trn_cell_extension_field_getconstarray_field(field),
+                 trn_cell_extension_field_getlen_field(field));
+  if (ret < 0) {
+    goto err;
+  }
+
+  /* Set the parameters from extension in INTRODUCE2 cell data */
+  if (hs_dos_decode_ec_point(data->dleq_pk, (const unsigned char*)
+                    trn_cell_extension_hs_dos_getconstarray_pub_key(hs_dos))){
+    goto err;
+  }
+  if (hs_dos_decode_bn(data->token_rn, (const unsigned char*)
+                    trn_cell_extension_hs_dos_getconstarray_token(hs_dos))){
+    goto err;
+  }
+  memcpy(data->redemption_hmac,
+         trn_cell_extension_hs_dos_getconstarray_redemption_mac(hs_dos),
+         sizeof(data->redemption_hmac));
+
+  trn_cell_extension_hs_dos_free(hs_dos);
+  return 0;
+
+  err:
+    if (data->token_rn){
+      BN_free(data->token_rn);
+      data->token_rn = NULL;
+    }
+    if (data->dleq_pk){
+      EC_POINT_free(data->dleq_pk);
+      data->dleq_pk = NULL;
+    }
+    memwipe(data->redemption_hmac, 0, HS_DOS_REDEMPTION_MAC);
+    trn_cell_extension_hs_dos_free(hs_dos);
+    return -1;
+};
+
+/* Parse every cell extension in the given INTRODUCE2 cell. 
+ * Return 0 on success, -1 on failure. */
+static void
+handle_introduce_encrypted_cell_extensions(
+                            hs_cell_introduce2_data_t *data,
+                            const trn_cell_introduce_encrypted_t *enc_cell)
+{
+  const trn_cell_extension_t *extensions;
+
+  tor_assert(enc_cell);
+  tor_assert(data);
+  extensions = trn_cell_introduce_encrypted_getconst_extensions(enc_cell);
+  if (extensions == NULL) {
+    goto end;
+  }
+
+  /* Go over all extensions. */
+  for (size_t idx = 0; idx < trn_cell_extension_get_num(extensions); idx++) {
+
+    const trn_cell_extension_field_t *field =
+      trn_cell_extension_getconst_fields(extensions, idx);
+    if (BUG(field == NULL)) {
+      /* The number of extensions should match the number of fields. */
+      break;
+    }
+
+    switch (trn_cell_extension_field_get_field_type(field)) {
+    case TRUNNEL_CELL_EXTENSION_TYPE_HS_DOS:
+      /* After this, the circuit should be set for DoS defenses. */
+      if (handle_introduce_encrypted_hs_dos_cell_extension(data, field)){
+        log_info(LD_REND, "Parsed HS DOS extension with invalid parameters");
+      }
+      break;
+    default:
+      /* Unknown extension. Skip over. */
+      break;
+    }
+  }
+
+  end:
+    return;
+}
+
 /* Parse the INTRODUCE2 cell using data which contains everything we need to
  * do so and contains the destination buffers of information we extract and
  * compute from the cell. Return 0 on success else a negative value. The
@@ -768,6 +1029,15 @@ hs_cell_parse_introduce2(hs_cell_introduce2_data_t *data,
     smartlist_add(data->link_specifiers, lspec_dup);
   }
 
+  /* We parse the extension to check for cookies, only if it is enabled */
+  if (service->config.hs_dos_defense_enabled){
+    handle_introduce_encrypted_cell_extensions(data, enc_cell);
+  }
+  else{
+    log_info(LD_REND, "Not handling extensions of INTRO2 cell."
+                      "HS DoS disabled.\n");
+  }
+
   /* Success. */
   ret = 0;
   log_info(LD_REND, "Valid INTRODUCE2 cell. Launching rendezvous circuit.");
@@ -780,6 +1050,76 @@ hs_cell_parse_introduce2(hs_cell_introduce2_data_t *data,
   tor_free(decrypted);
   trn_cell_introduce_encrypted_free(enc_cell);
   trn_cell_introduce1_free(cell);
+  return ret;
+}
+
+/* Parse the TOKEN1 cell using data which contains everything we need to
+ * do so and contains the destination buffers of information we extract and
+ * compute from the cell. Return 0 on success else a negative value. The
+ * service and circ are only used for logging purposes. */
+ssize_t
+hs_cell_parse_token1(hs_cell_token1_data_t *data,
+                     const origin_circuit_t *circ,
+                     const hs_service_t *service)
+{
+  int ret = -1;
+  trn_cell_token1_t *cell = NULL;
+
+  tor_assert(data);
+  tor_assert(circ);
+  tor_assert(service);
+
+  /* Parse the cell into a decoded data structure pointed by cell_ptr. */
+  if (parse_token1_cell(service, circ, data->payload, data->payload_len,
+                            &cell) < 0) {
+    goto done;
+  }
+
+  log_info(LD_REND, "Received a decodable TOKEN1 cell on circuit %u "
+                    "for service %s. Decoding encrypted section...",
+           TO_CIRCUIT(circ)->n_circ_id,
+           safe_str_client(service->onion_address));
+
+  data->is_first = trn_cell_token1_get_first_cell(cell);
+  data->is_last = trn_cell_token1_get_last_cell(cell);
+  data->token_num = trn_cell_token1_get_token_num(cell);
+  if (data->is_first){
+    data->pow_len = trn_hs_pow_get_pow_len(
+                                      trn_cell_token1_get_pow(cell, 0));
+    data->pow = tor_memdup(trn_hs_pow_getconstarray_proof_of_work(
+                                      trn_cell_token1_get_pow(cell, 0)),
+                          data->pow_len);
+    data->batch_size = trn_cell_token1_get_batch_size(cell, 0);
+  }
+  data->tokens = smartlist_new();
+  for (int i=0; i< data->token_num; i++){
+    hs_dos_sig_token_t *sig_tok = hs_dos_sig_token_t_new();
+    const trn_hs_token_t *tok = trn_cell_token1_getconst_tokens(cell, i);
+    sig_tok->seq_num = trn_hs_token_get_seq_num(tok);
+    if (hs_dos_decode_ec_point(sig_tok->blind_token,
+                (const unsigned char*) trn_hs_token_getconstarray_token(tok))){
+      hs_dos_sig_token_t_free(sig_tok);
+      goto done;
+    }
+    smartlist_add(data->tokens, sig_tok);
+  }
+  
+  /* Success. */
+  ret = 0;
+  log_info(LD_REND, "Valid TOKEN1 cell.");
+
+ done:
+  if (ret){
+    tor_free(data->pow);
+    if (data->tokens){
+      SMARTLIST_FOREACH(data->tokens,
+                        hs_dos_sig_token_t*,
+                        sig_tok,
+                        hs_dos_sig_token_t_free(sig_tok));
+      smartlist_free(data->tokens);
+    }
+  }
+  trn_cell_token1_free(cell);
   return ret;
 }
 
@@ -942,6 +1282,108 @@ hs_cell_parse_rendezvous2(const uint8_t *payload, size_t payload_len,
   return ret;
 }
 
+/* Parse an TOKEN2 cell from payload of size payload_len for the given
+ * service and circuit which are used only for logging purposes. The resulting
+ * parsed cell is put in cell_ptr_out.
+ *
+ * Return 0 on success else a negative value and cell_ptr_out is untouched. */
+static int
+parse_token2_cell(const origin_circuit_t *circ,
+                  const uint8_t *payload,
+                  size_t payload_len,
+                  trn_cell_token2_t **cell_ptr_out)
+{
+  trn_cell_token2_t *cell = NULL;
+
+  tor_assert(circ);
+  tor_assert(payload);
+  tor_assert(cell_ptr_out);
+  /* Parse the cell so we can start cell validation. */
+  if (trn_cell_token2_parse(&cell, payload, payload_len) < 0) {
+    log_info(LD_PROTOCOL, "Unable to parse TOKEN2 cell on circuit %u ",
+             TO_CIRCUIT(circ)->n_circ_id);
+    goto err;
+  }
+
+  /* Success. */
+  *cell_ptr_out = cell;
+  return 0;
+ err:
+  return -1;
+}
+
+/* Handle a TOKEN2 cell encoded in payload of length payload_len. On
+ * success, handshake_info contains the data in the HANDSHAKE_INFO field, and
+ * 0 is returned. On error, a negative value is returned. */
+int
+hs_cell_parse_token2(const origin_circuit_t *circ,
+                     hs_cell_token2_data_t *data,
+                     const uint8_t *payload,
+                     const size_t payload_len)
+{
+  int ret = -1;
+  trn_cell_token2_t *cell = NULL;
+
+  tor_assert(circ);
+  tor_assert(data);
+  tor_assert(payload);
+
+  /* Parse the cell into a decoded data structure pointed by cell_ptr. */
+  if (parse_token2_cell(circ, payload, payload_len,
+                            &cell) < 0) {
+    goto done;
+  }
+
+  log_info(LD_REND, "Received a decodable TOKEN1 cell on circuit %u ",
+           TO_CIRCUIT(circ)->n_circ_id);
+
+  /* TODO */
+
+  data->is_first = trn_cell_token2_get_first_cell(cell);
+  data->is_last = trn_cell_token2_get_last_cell(cell);
+  data->token_num = trn_cell_token2_get_token_num(cell);
+  if (data->is_first){
+    data->dleq_pk = tor_memdup(trn_dleq_pk_getarray_dleq_pk(
+                                      trn_cell_token2_get_dleq_pk(cell, 0)),
+                               HS_DOS_EC_POINT_LEN);
+    data->dleq_proof = tor_memdup(trn_dleq_proof_getarray_dleq_proof(
+                                      trn_cell_token2_get_dleq_proof(cell, 0)),
+                               HS_DOS_PROOF_LEN);
+    data->batch_size = trn_cell_token2_get_batch_size(cell, 0);
+  }
+  data->tokens = smartlist_new();
+  for (int i=0; i< data->token_num; i++){
+    hs_dos_sig_token_t *sig_tok = hs_dos_sig_token_t_new();
+    const trn_hs_token_t *tok = trn_cell_token2_getconst_tokens(cell, i);
+    sig_tok->seq_num = trn_hs_token_get_seq_num(tok);
+    if (hs_dos_decode_ec_point(sig_tok->oprf_out_blind_token,
+                (const unsigned char*) trn_hs_token_getconstarray_token(tok))){
+      hs_dos_sig_token_t_free(sig_tok);
+      goto done;
+    }
+    smartlist_add(data->tokens, sig_tok);
+  }
+
+  /* Success. */
+  ret = 0;
+  log_info(LD_REND, "Valid TOKEN1 cell.");
+
+  done:
+  if (ret){
+    tor_free(data->dleq_pk);
+    tor_free(data->dleq_proof);
+    if (data->tokens){
+      SMARTLIST_FOREACH(data->tokens,
+                        hs_dos_sig_token_t*,
+                        sig_tok,
+                        hs_dos_sig_token_t_free(sig_tok));
+      smartlist_free(data->tokens);
+    }
+  }
+  trn_cell_token2_free(cell);
+  return ret;
+}
+
 /* Clear the given INTRODUCE1 data structure data. */
 void
 hs_cell_introduce1_data_clear(hs_cell_introduce1_data_t *data)
@@ -957,3 +1399,150 @@ hs_cell_introduce1_data_clear(hs_cell_introduce1_data_t *data)
   memwipe(data, 0, sizeof(hs_cell_introduce1_data_t));
 }
 
+/* Build the TOKEN2 cells and store them in the sendable_cells list
+ * Return 0 on success, -1 on failure */
+int hs_cell_build_token2_cells(smartlist_t *sendable_cells,
+                               int batch_size,
+                               uint8_t *enc_dleq_pk,
+                               uint8_t *enc_dleq_proof,
+                               hs_dos_sig_token_t **s_token)
+{
+  int ret = -1;
+  ssize_t payload_len;
+  ssize_t token_len;
+  trn_cell_token2_t *cell;
+  trn_cell_extension_t *ext;
+  trn_dleq_pk_t *dleq_pk;
+  trn_dleq_proof_t *dleq_proof;
+  trn_hs_token_t *cur_token = NULL;
+  hs_cell_token2_data_t *tok_data;
+  unsigned char encoded_token[HS_DOS_EC_POINT_LEN];
+
+  tor_assert(sendable_cells);
+  tor_assert(enc_dleq_pk);
+  tor_assert(enc_dleq_proof);
+  tor_assert(s_token);
+  tor_assert(batch_size>0);
+  
+  cell = trn_cell_token2_new();
+  tor_assert(cell);
+  dleq_pk = trn_dleq_pk_new();
+  tor_assert(dleq_pk);
+  dleq_proof = trn_dleq_proof_new();
+  tor_assert(dleq_proof);
+  ext = trn_cell_extension_new();
+  tor_assert(ext);
+
+  /* Set extension data. None are used. */
+  trn_cell_extension_set_num(ext, 0);
+  trn_cell_token2_set_extensions(cell, ext);
+
+  trn_cell_token2_set_last_cell(cell, 0);
+  trn_cell_token2_set_token_num(cell, 0);
+  trn_cell_token2_setlen_tokens(cell, 0);
+  trn_cell_token2_setlen_batch_size(cell, 1);
+  trn_cell_token2_set_first_cell(cell, 1);
+
+  trn_cell_token2_set_batch_size(cell, 0, batch_size);
+  memcpy(trn_dleq_pk_getarray_dleq_pk(dleq_pk),
+         enc_dleq_pk,
+         HS_DOS_EC_POINT_LEN);
+  trn_cell_token2_add_dleq_pk(cell, dleq_pk);
+  memcpy(trn_dleq_proof_getarray_dleq_proof(dleq_proof),
+         enc_dleq_proof,
+         HS_DOS_PROOF_LEN);
+  trn_cell_token2_add_dleq_proof(cell, dleq_proof);
+
+  for (uint8_t seq=0; seq<batch_size; seq++){
+
+    tor_assert(s_token[seq]);
+    tor_assert(s_token[seq]->oprf_out_blind_token);
+
+    cur_token = trn_hs_token_new();
+    tor_assert(cur_token);
+
+    trn_hs_token_set_seq_num(cur_token, s_token[seq]->seq_num);
+    if (hs_dos_encode_ec_point(encoded_token,
+                               s_token[seq]->oprf_out_blind_token)){
+      goto end;
+    }
+    memcpy(trn_hs_token_getarray_token(cur_token),
+           encoded_token,
+           HS_DOS_EC_POINT_LEN);
+    payload_len = trn_cell_token2_encoded_len(cell);
+    token_len = trn_hs_token_encoded_len(cur_token);
+    if (payload_len<0 || token_len<0){
+      goto end;
+    }
+    /* TODO: handle the case where this is not true
+     * It should only be possible in the first iteration of the loop
+     * Currently the first token simply will not be used
+     * which will lead to a failure when the client verifies the proof */
+    if (payload_len+token_len<=RELAY_PAYLOAD_SIZE){
+      trn_cell_token2_set_token_num(cell,
+                                    trn_cell_token2_get_token_num(cell)+1);
+      trn_cell_token2_add_tokens(cell, cur_token);
+      cur_token = NULL;
+    }
+    else{
+      log_warn(LD_BUG, "Unable to add token (%u of %d)"
+                       "to TOKEN2 cell on circuit.",
+                        seq,
+                        batch_size);
+      goto end;
+    }
+
+    /* This is the last cell we are building */
+    if (seq==batch_size-1){
+      trn_cell_token2_set_last_cell(cell, 1);
+    }
+
+    /* This cell is either full or the last one so we can send it */
+    if(seq==batch_size-1 || payload_len+(2*token_len)>RELAY_PAYLOAD_SIZE){
+      tok_data = tor_malloc_zero(sizeof(hs_cell_token2_data_t));
+      tok_data->payload = tor_malloc(RELAY_PAYLOAD_SIZE*sizeof(uint8_t));
+      tok_data->payload_len = trn_cell_token2_encode(tok_data->payload,
+                                                     RELAY_PAYLOAD_SIZE,
+                                                     cell);
+      if (tok_data->payload_len<=0){
+        tor_free(tok_data->payload);
+        tor_free(tok_data);
+        goto end;
+      }
+      smartlist_add(sendable_cells, tok_data);
+
+      /* Make the loop continue and prepare another cell
+       * unset cell etc*/
+      if(seq!=batch_size-1){
+        payload_len = 0;
+        if (cur_token){
+          trn_hs_token_free(cur_token);
+          cur_token = NULL;
+        }
+        trn_cell_token2_setlen_tokens(cell, 0);
+        trn_cell_token2_setlen_dleq_pk(cell, 0);
+        dleq_pk = NULL;
+        trn_cell_token2_setlen_dleq_proof(cell, 0);
+        dleq_proof = NULL;
+        trn_cell_token2_setlen_batch_size(cell, 0);
+        trn_cell_token2_set_last_cell(cell, 0);
+        trn_cell_token2_set_first_cell(cell, 0);
+        trn_cell_token2_set_token_num(cell, 0);
+      }
+    }
+
+  }
+  /* Success */
+  ret = 0;
+  end:
+    if (cur_token){
+      trn_hs_token_free(cur_token);
+      cur_token = NULL;
+    }
+    trn_cell_token2_setlen_tokens(cell, 0);
+    trn_cell_token2_setlen_dleq_pk(cell, 0);
+    trn_cell_token2_setlen_dleq_proof(cell, 0);
+    trn_cell_token2_setlen_batch_size(cell, 0);
+    trn_cell_token2_free(cell);
+    return ret;
+};

@@ -11,6 +11,7 @@
 
 #include "core/or/or.h"
 #include "feature/hs/hs_service.h"
+#include "core/crypto/hs_dos_crypto.h"
 
 /* An INTRODUCE1 cell requires at least this amount of bytes (see section
  * 3.2.2 of the specification). Below this value, the cell must be padded. */
@@ -38,6 +39,11 @@ typedef struct hs_cell_introduce1_data_t {
   const curve25519_keypair_t *client_kp;
   /* Rendezvous point link specifiers. */
   smartlist_t *link_specifiers;
+  /* These will only be set if a hs dos token is spent when sending the cell */
+  unsigned int hs_dos_token : 1;
+  char redemption_hmac[HS_DOS_REDEMPTION_MAC];
+  unsigned char token_rn[HS_DOS_EC_BN_LEN];
+  unsigned char dleq_pk[HS_DOS_EC_POINT_LEN];
 } hs_cell_introduce1_data_t;
 
 /* This data structure contains data that we need to parse an INTRODUCE2 cell
@@ -75,7 +81,60 @@ typedef struct hs_cell_introduce2_data_t {
   smartlist_t *link_specifiers;
   /* Replay cache of the introduction point. */
   replaycache_t *replay_cache;
+  /* For HS DOS defenses */
+  /* TODO add a bool to indicate whether we have a token or not? */
+  BIGNUM *token_rn;
+  EC_POINT *dleq_pk;
+  char redemption_hmac[HS_DOS_REDEMPTION_MAC];
 } hs_cell_introduce2_data_t;
+
+/* This data structure contains data that we need to build and parse a TOKEN1
+ * cell used by the TOKEN1 build function. */
+typedef struct hs_cell_token1_data_t {
+  /* Payload of the received encoded cell. */
+  const uint8_t *payload;
+  /* Size of the payload of the received encoded cell. */
+  size_t payload_len;
+  /** Is this the first cell of the batch? */
+  unsigned int is_first : 1;
+  /** Is this the last cell of the batch? */
+  unsigned int is_last : 1;
+  /** The length of pow, must be 0 if not is_first */
+  uint8_t pow_len;
+  /** The actual solution to the challenge */
+  uint8_t *pow;
+  /** The size of the complete batch of token */
+  uint8_t batch_size;
+  /** The number of tokens sent in this cell */
+  uint8_t token_num;
+  /** The actual tokens to be signed, amount is token_num */
+  smartlist_t *tokens;
+} hs_cell_token1_data_t;
+
+/* This data structure contains data that we need to build and parse a TOKEN2
+ * cell used by the TOKEN2 build function. */
+typedef struct hs_cell_token2_data_t {
+  /* Payload of the received encoded cell. */
+  uint8_t *payload;
+  /* Size of the payload of the received encoded cell. */
+  size_t payload_len;
+  /** Is this the first cell of the batch? */
+  unsigned int is_first : 1;
+  /** Is this the last cell of the batch? */
+  unsigned int is_last : 1;
+  /** The binary encoded dleq_pk */
+  uint8_t *dleq_pk;
+  /** The binary encoded dleq_proof */
+  uint8_t *dleq_proof;
+  /** The size of the complete batch of token */
+  uint8_t batch_size;
+  /** The number of tokens sent in this cell */
+  uint8_t token_num;
+  /** The actual tokens to be signed, amount is token_num */
+  smartlist_t *tokens;
+} hs_cell_token2_data_t;
+
+void hs_cell_token2_data_free(hs_cell_token2_data_t *data);
 
 /* Build cell API. */
 ssize_t hs_cell_build_establish_intro(const char *circ_nonce,
@@ -90,6 +149,11 @@ ssize_t hs_cell_build_introduce1(const hs_cell_introduce1_data_t *data,
                                  uint8_t *cell_out);
 ssize_t hs_cell_build_establish_rendezvous(const uint8_t *rendezvous_cookie,
                                            uint8_t *cell_out);
+int hs_cell_build_token2_cells(smartlist_t *sendable_cells,
+                               int batch_size,
+                               uint8_t *enc_dleq_pk,
+                               uint8_t *enc_dleq_proof,
+                               hs_dos_sig_token_t **s_token);
 
 /* Parse cell API. */
 ssize_t hs_cell_parse_intro_established(const uint8_t *payload,
@@ -97,6 +161,13 @@ ssize_t hs_cell_parse_intro_established(const uint8_t *payload,
 ssize_t hs_cell_parse_introduce2(hs_cell_introduce2_data_t *data,
                                  const origin_circuit_t *circ,
                                  const hs_service_t *service);
+ssize_t hs_cell_parse_token1(hs_cell_token1_data_t *data,
+                             const origin_circuit_t *circ,
+                             const hs_service_t *service);
+int hs_cell_parse_token2(const origin_circuit_t *circ,
+                         hs_cell_token2_data_t *data,
+                         const uint8_t *payload,
+                         const size_t payload_len);
 int hs_cell_parse_introduce_ack(const uint8_t *payload, size_t payload_len);
 int hs_cell_parse_rendezvous2(const uint8_t *payload, size_t payload_len,
                               uint8_t *handshake_info,

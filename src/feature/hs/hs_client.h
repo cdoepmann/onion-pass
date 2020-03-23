@@ -13,6 +13,8 @@
 #include "feature/hs/hs_descriptor.h"
 #include "feature/hs/hs_ident.h"
 
+#include "core/crypto/hs_dos_crypto.h"
+
 /* Status code of a descriptor fetch request. */
 typedef enum {
   /* Something internally went wrong. */
@@ -40,6 +42,23 @@ typedef struct hs_client_service_authorization_t {
   /* An onion address that is used to connect to the onion service. */
   char onion_address[HS_SERVICE_ADDR_LEN_BASE32+1];
 } hs_client_service_authorization_t;
+
+void hs_client_request_tokens(origin_circuit_t *rdv_circ,
+                              unsigned int batch_size,
+                              uint8_t pow_len,
+                              const uint8_t *pow);
+
+void sync_spendable_tokens(void);
+
+hs_dos_storable_token_t *hs_client_pop_spendable_token(
+                                    const ed25519_public_key_t identity_pk,
+                                    const EC_POINT *dleq_pk);
+
+void hs_client_add_spendable_tokens(
+                        const ed25519_public_key_t identity_pk,
+                        const EC_POINT *dleq_pk,
+                        const hs_dos_token_t **tokens,
+                        int batch_size);
 
 void hs_client_note_connection_attempt_succeeded(
                                        const edge_connection_t *conn);
@@ -71,6 +90,9 @@ int hs_client_receive_introduce_ack(origin_circuit_t *circ,
 int hs_client_receive_rendezvous2(origin_circuit_t *circ,
                                   const uint8_t *payload,
                                   size_t payload_len);
+int hs_client_receive_token2(origin_circuit_t *circ,
+                             const uint8_t *payload,
+                             size_t payload_len);
 
 void hs_client_desc_has_arrived(const hs_ident_dir_conn_t *ident);
 
@@ -104,6 +126,8 @@ STATIC extend_info_t *
 desc_intro_point_to_extend_info(const hs_desc_intro_point_t *ip);
 
 STATIC int handle_rendezvous2(origin_circuit_t *circ, const uint8_t *payload,
+                              size_t payload_len);
+STATIC int handle_token2(origin_circuit_t *circ, const uint8_t *payload,
                               size_t payload_len);
 
 MOCK_DECL(STATIC hs_client_fetch_status_t,

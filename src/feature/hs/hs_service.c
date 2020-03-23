@@ -55,6 +55,9 @@
 #include "lib/encoding/confline.h"
 #include "lib/crypt_ops/crypto_format.h"
 
+#include "feature/hs/hs_dos.h"
+#include "core/crypto/hs_dos_crypto.h"
+
 /* Trunnel */
 #include "trunnel/ed25519_cert.h"
 #include "trunnel/hs/cell_common.h"
@@ -94,6 +97,8 @@ static const char fname_keyfile_prefix[] = "hs_ed25519";
 static const char dname_client_pubkeys[] = "authorized_clients";
 static const char fname_hostname[] = "hostname";
 static const char address_tld[] = "onion";
+static const char fname_dleq_sec_key[] = "dleq_secret_key";
+static const char fname_prev_dleq_sec_key[] = "dleq_previous_secret_key";
 
 /* Staging list of service object. When configuring service, we add them to
  * this list considered a staging area and they will get added to our global
@@ -171,6 +176,23 @@ find_service(hs_service_ht *map, const ed25519_public_key_t *pk)
   return HT_FIND(hs_service_ht, map, &dummy_service);
 }
 
+/* Initialize the INTRODUCE2 token bucket for the DoS defenses using the
+ * consensus/default values. We might get a cell extension that changes those
+ * later but if we don't, the default or consensus parameters are used. */
+static void
+hs_dos_setup_token_bucket(hs_service_t *service)
+{
+  tor_assert(service);
+
+  if (!service->config.hs_dos_defense_enabled)
+    return;
+
+  token_bucket_ctr_init(&service->introduce2_bucket,
+                        service->config.hs_dos_rate_per_sec,
+                        service->config.hs_dos_burst_per_sec,
+                        (uint32_t) approx_time());
+}
+
 /* Register the given service in the given map. If the service already exists
  * in the map, -1 is returned. On success, 0 is returned and the service
  * ownership has been transferred to the global map. */
@@ -185,6 +207,8 @@ register_service(hs_service_ht *map, hs_service_t *service)
     /* Existing service with the same key. Do not register it. */
     return -1;
   }
+  /* TODO: do this at a more appropriate location than here... */
+  hs_dos_setup_token_bucket(service);
   /* Taking ownership of the object at this point. */
   HT_INSERT(hs_service_ht, map, service);
 
@@ -242,6 +266,10 @@ set_service_default_config(hs_service_config_t *c,
   c->is_single_onion = 0;
   c->dir_group_readable = 0;
   c->is_ephemeral = 0;
+  c->hs_dos_defense_enabled = HS_CONFIG_V3_HS_DOS_DEFENSE_DEFAULT;
+  c->hs_dos_token_num = HS_CONFIG_V3_HS_DOS_DEFENSE_TOKEN_NUMBER_DEFAULT;
+  c->hs_dos_rate_per_sec = HS_CONFIG_V3_HS_DOS_DEFENSE_RATE_PER_SEC_DEFAULT;
+  c->hs_dos_burst_per_sec = HS_CONFIG_V3_HS_DOS_DEFENSE_BURST_PER_SEC_DEFAULT;
 }
 
 /* From a service configuration object config, clear everything from it
@@ -991,6 +1019,66 @@ write_address_to_file(const hs_service_t *service, const char *fname_)
   return ret;
 }
 
+/* Loads the EC sec key from the given file and returns it,
+ * Return Null on failure. */
+static EC_KEY *load_dleq_key(const char *fname)
+{
+  tor_assert(fname);
+
+  struct stat st;
+  char *content = NULL;
+  EC_KEY *key = hs_dos_generate_keypair();
+  tor_assert(key);
+  BIGNUM *private_key = BN_new();
+  tor_assert(private_key);
+  EC_POINT *pub_key = EC_POINT_new(hs_dos_get_group());
+  tor_assert(pub_key);
+
+  st.st_size = 0;
+  content = read_file_to_str(fname, RFTS_BIN|RFTS_IGNORE_MISSING, &st);
+  if (!content) {
+    return NULL;
+  }
+  if (st.st_size != HS_DOS_B64_BN_LEN-1){
+    goto err;
+  }
+  if (hs_dos_b64_decode_bn(private_key, content))
+    goto err;
+  if (!EC_KEY_set_private_key(key, private_key))
+    goto err;
+  if (hs_dos_ec_mul(pub_key, hs_dos_get_generator(), private_key))
+    goto err;
+  if (!EC_KEY_set_public_key(key, pub_key))
+    goto err;
+  
+  BN_free(private_key);
+  EC_POINT_free(pub_key);
+  tor_free(content);
+  return key;
+
+  err:
+    EC_KEY_free(key);
+    EC_POINT_free(pub_key);
+    BN_free(private_key);
+    tor_free(content);
+    return NULL;
+}
+
+static int write_dleq_key_to_file(const char *fname, EC_KEY *dleq_key)
+{
+  char b64_key[HS_DOS_B64_BN_LEN];
+  
+  tor_assert(fname);
+  tor_assert(dleq_key);
+
+  if (hs_dos_b64_encode_bn(b64_key, EC_KEY_get0_private_key(dleq_key)) !=
+                                                        HS_DOS_B64_BN_LEN-1){
+    return -1;
+  }
+
+  return write_str_to_file(fname, b64_key, 1);
+};
+
 /* Load and/or generate private keys for the given service. On success, the
  * hostname file will be written to disk along with the master private key iff
  * the service is not configured for offline keys. Return 0 on success else -1
@@ -1060,9 +1148,42 @@ load_service_keys(hs_service_t *service)
     goto end;
   }
 
+  /** TODO: check if we have them on disk */
+  service->prv_handler = hs_dos_handler_t_new();
+  service->cur_handler = hs_dos_handler_t_new();
+  tor_free(fname);
+  fname = hs_path_from_filename(config->directory_path, fname_dleq_sec_key);
+  EC_KEY *key = load_dleq_key(fname);
+  if (key){
+    EC_KEY_free(service->cur_handler->hs_dos_oprf_key);
+    service->cur_handler->hs_dos_oprf_key = key;
+    key = NULL;
+  }
+  else{
+    /* write to file */
+    if (write_dleq_key_to_file(fname, service->cur_handler->hs_dos_oprf_key))
+      goto end;
+  }
+  tor_free(fname);
+  fname = hs_path_from_filename(config->directory_path,
+                                fname_prev_dleq_sec_key);
+  key = load_dleq_key(fname);
+  if (key){
+    EC_KEY_free(service->prv_handler->hs_dos_oprf_key);
+    service->prv_handler->hs_dos_oprf_key = key;
+    key = NULL;
+  }
+  else{
+    /* write to file */
+    if (write_dleq_key_to_file(fname, service->prv_handler->hs_dos_oprf_key))
+      goto end;
+  }
+
+
   /* Succes. */
   ret = 0;
  end:
+  EC_KEY_free(key);
   tor_free(fname);
   return ret;
 }
@@ -1688,6 +1809,34 @@ build_desc_signing_key_cert(hs_service_descriptor_t *desc, time_t now)
   tor_assert_nonfatal(plaintext->signing_key_cert);
 }
 
+/**
+ * Sets the descriptor values as they are stored in the service struct.
+ * Return 0 on success, -1 on failure. */
+static int set_desc_defenses(hs_desc_dos_defense_t *desc, const hs_service_t *service)
+{
+  tor_assert(desc);
+  tor_assert(service);
+  const EC_POINT *g = hs_dos_get_generator();
+  desc->hs_dos_max_token_number = service->config.hs_dos_token_num;
+  int ret = -1;
+  if (service->cur_handler){
+    if (!EC_POINT_copy(desc->dleq_public_key, EC_KEY_get0_public_key(service->cur_handler->hs_dos_oprf_key)))
+      return -1;
+    if (!EC_POINT_copy(desc->dleq_generator, g))
+      return -1;
+    ret = 0;
+  }
+  if (service->prv_handler){
+    if (!EC_POINT_copy(desc->previous_dleq_public_key, EC_KEY_get0_public_key(service->prv_handler->hs_dos_oprf_key)))
+      return -1;
+    if (!EC_POINT_copy(desc->previous_generator, g))
+      return -1;
+    ret = 0;
+  }
+  return ret;
+};
+
+
 /* Populate the descriptor encrypted section from the given service object.
  * This will generate a valid list of introduction points that can be used
  * after for circuit creation. Return 0 on success else -1 on error. */
@@ -1705,6 +1854,15 @@ build_service_desc_encrypted(const hs_service_t *service,
   encrypted->create2_ntor = 1;
   encrypted->single_onion_service = service->config.is_single_onion;
 
+  encrypted->hs_dos_defenses_enabled = service->config.hs_dos_defense_enabled;
+  if (!service->config.hs_dos_defense_enabled){
+    hs_desc_dos_defense_t_free(encrypted->hs_dos_defenses);
+  }
+  else{
+    encrypted->hs_dos_defenses = hs_desc_dos_defense_t_new();
+    if (set_desc_defenses(encrypted->hs_dos_defenses, service))
+      return -1;
+  }
   /* Setup introduction points from what we have in the service. */
   if (encrypted->intro_points == NULL) {
     encrypted->intro_points = smartlist_new();
@@ -3331,6 +3489,43 @@ service_handle_introduce2(origin_circuit_t *circ, const uint8_t *payload,
   return -1;
 }
 
+/* We just received an TOKEN1 cell on the established rendezvous circuit
+ * circ. Handle the cell and return 0 on success else a negative value. */
+static int
+service_handle_token1(origin_circuit_t *circ, const uint8_t *payload,
+                          size_t payload_len)
+{
+  hs_service_t *service = NULL;
+
+  tor_assert(circ);
+  tor_assert(payload);
+  tor_assert(TO_CIRCUIT(circ)->purpose == CIRCUIT_PURPOSE_S_REND_JOINED);
+
+  /* We'll need every object associated with this circuit. */
+  get_objects_from_ident(circ->hs_ident, &service, NULL, NULL);
+
+  /* Get service object from the circuit identifier. */
+  if (service == NULL) {
+    log_warn(LD_BUG, "Unknown service identity key %s when handling "
+                     "a TOKEN1 cell on circuit %u",
+             safe_str_client(ed25519_fmt(&circ->hs_ident->identity_pk)),
+             TO_CIRCUIT(circ)->n_circ_id);
+    goto err;
+  }
+
+  if (!service->config.hs_dos_defense_enabled)
+    goto err;
+
+  /* The following will parse, decode and launch the rendezvous point circuit.
+   * Both current and legacy cells are handled. */
+  if (hs_circ_handle_token1(service, circ, payload, payload_len) < 0) {
+    goto err;
+  }
+  return 0;
+ err:
+  return -1;
+}
+
 /* Add to list every filename used by service. This is used by the sandbox
  * subsystem. */
 static void
@@ -3846,6 +4041,36 @@ hs_service_receive_introduce2(origin_circuit_t *circ, const uint8_t *payload,
   return ret;
 }
 
+/* Called when we get an INTRODUCE2 cell on the circ. Respond to the cell and
+ * launch a circuit to the rendezvous point. */
+int
+hs_service_receive_token1(origin_circuit_t *circ, const uint8_t *payload,
+                              size_t payload_len)
+{
+  int ret = -1;
+
+  tor_assert(circ);
+  tor_assert(payload);
+
+  /* Do some initial validation and logging before we parse the cell */
+  if (TO_CIRCUIT(circ)->purpose != CIRCUIT_PURPOSE_S_REND_JOINED) {
+    log_warn(LD_PROTOCOL, "Received a TOKEN1 cell on a "
+                          "non rendezvous circuit of purpose %d",
+             TO_CIRCUIT(circ)->purpose);
+    goto done;
+  }
+
+  if (circ->hs_ident) {
+    ret = service_handle_token1(circ, payload, payload_len);
+  } else {
+    log_warn(LD_PROTOCOL, "Received an TOKEN1 cell on a "
+                          "non HSv3 rendezvous circuit of purpose");
+  }
+
+ done:
+  return ret;
+}
+
 /* Called when we get an INTRO_ESTABLISHED cell. Mark the circuit as an
  * established introduction point. Return 0 on success else a negative value
  * and the circuit is closed. */
@@ -4022,6 +4247,8 @@ hs_service_free_(hs_service_t *service)
   if (service == NULL) {
     return;
   }
+  hs_dos_handler_t_free(service->cur_handler);
+  hs_dos_handler_t_free(service->prv_handler);
 
   /* Free descriptors. Go over both descriptor with this loop. */
   FOR_EACH_DESCRIPTOR_BEGIN(service, desc) {
@@ -4063,6 +4290,97 @@ hs_service_run_scheduled_events(time_t now)
   run_build_circuit_event(now);
   /* Upload the descriptors if needed/possible. */
   run_upload_descriptor_event(now);
+}
+
+/* Return current DLEQ Pubkey or NULL if none is set */
+const EC_POINT *hs_service_get_current_dleq_pk(const hs_service_t *service)
+{
+  tor_assert(service);
+  if (service->cur_handler && service->cur_handler->hs_dos_oprf_key){
+    return EC_KEY_get0_public_key(
+                      (const EC_KEY*) service->cur_handler->hs_dos_oprf_key);
+  }
+  return NULL;
+};
+
+/* Return previous DLEQ Pubkey or NULL if none is set */
+const EC_POINT *hs_service_get_previous_dleq_pk(const hs_service_t *service)
+{
+  tor_assert(service);
+  if (service->prv_handler && service->prv_handler->hs_dos_oprf_key){
+    return EC_KEY_get0_public_key(
+                      (const EC_KEY*) service->prv_handler->hs_dos_oprf_key);
+  }
+  return NULL;
+};
+
+/* Return true iff a rendezvous circuit can be launched based on the INTRO2
+ * cell the service received */
+bool hs_dos_can_launch_rendezvous(hs_service_t *service,
+                                  const EC_POINT *dleq_pk,
+                                  const BIGNUM *token_rn,
+                                  const char *redemption_hmac)
+{
+  hs_dos_handler_t *handler = NULL;
+
+  tor_assert(service);
+
+  /* Allow to send the cell if the DoS defenses are disabled on the circuit.
+   * This can be set by the consensus, the ESTABLISH_INTRO cell extension or
+   * the hardcoded values in tor code. */
+  if (!service->config.hs_dos_defense_enabled) {
+    return true;
+  }
+
+  /* This is called just after we got a valid and parsed INTRODUCE2 cell.
+   *
+   * First, the INTRODUCE2 bucket will be refilled (if any). Then, decremented
+   * because we are about to launch or not a rendezvous circuit based on the
+   * cell we just got. Finally, evaluate if we can launch it based on our
+   * token bucket state. */
+
+  /* Refill INTRODUCE2 bucket. */
+  token_bucket_ctr_refill(&service->introduce2_bucket,
+                          (uint32_t) approx_time());
+
+  /* Decrement the bucket for this valid INTRODUCE2 cell we just got. Don't
+   * underflow else we end up with a too big of a bucket. */
+  if (token_bucket_ctr_get(&service->introduce2_bucket) > 0) {
+    token_bucket_ctr_dec(&service->introduce2_bucket, 1);
+  }
+
+  /* Validate the token */
+  if (!dleq_pk || !token_rn || !redemption_hmac)
+    goto tok_fail;
+  if (0 == hs_dos_points_cmp(dleq_pk,
+                              hs_service_get_current_dleq_pk(service))){
+    handler = service->cur_handler;
+  }
+  else if (0 == hs_dos_points_cmp(dleq_pk,
+                              hs_service_get_previous_dleq_pk(service))){
+    handler = service->prv_handler;
+  }
+  else{
+    goto tok_fail;
+  }
+  tor_assert(handler);
+  if (hs_dos_redeem_token(
+                          redemption_hmac,
+                          token_rn,
+                          service->onion_address,
+                          sizeof(service->onion_address),
+                          handler))
+    goto tok_fail;
+  log_info(LD_REND,
+        "Successfully validated a token of %s"
+        "Launching Rendezvous circuit.", service->onion_address);
+  printf("Parsed INTRO2 cell with valid token\n");
+  return true;
+
+  tok_fail:
+    printf("Parsed INTRO2 cell without valid token\n");
+    /* Finally, we can launch the rendezvous circuit, or not*/
+    return token_bucket_ctr_get(&service->introduce2_bucket) > 0;
 }
 
 /* Initialize the service HS subsystem. */

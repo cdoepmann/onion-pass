@@ -16,8 +16,12 @@
 
 /* Cleanup function when the circuit is closed or/and freed. */
 void hs_circ_cleanup(circuit_t *circ);
+void unset_token_request(origin_circuit_t *circ);
 
 /* Circuit API. */
+int hs_circ_send_token1_cells(origin_circuit_t *rdv_circ,
+                              uint8_t pow_len,
+                              const uint8_t *pow);
 int hs_circ_service_intro_has_opened(hs_service_t *service,
                                      hs_service_intro_point_t *ip,
                                      const hs_service_descriptor_t *desc,
@@ -42,15 +46,21 @@ int hs_circ_handle_intro_established(const hs_service_t *service,
                                      origin_circuit_t *circ,
                                      const uint8_t *payload,
                                      size_t payload_len);
-int hs_circ_handle_introduce2(const hs_service_t *service,
+int hs_circ_handle_introduce2(hs_service_t *service,
                               const origin_circuit_t *circ,
                               hs_service_intro_point_t *ip,
                               const uint8_t *subcredential,
                               const uint8_t *payload, size_t payload_len);
+int hs_circ_handle_token1(const hs_service_t *service,
+                          origin_circuit_t *circ,
+                          const uint8_t *payload,
+                          size_t payload_len);
 int hs_circ_send_introduce1(origin_circuit_t *intro_circ,
                             origin_circuit_t *rend_circ,
                             const hs_desc_intro_point_t *ip,
-                            const uint8_t *subcredential);
+                            const uint8_t *subcredential,
+                            const EC_POINT *dleq_pk,
+                            const hs_dos_storable_token_t *tok);
 int hs_circ_send_establish_rendezvous(origin_circuit_t *circ);
 
 /* e2e circuit API. */

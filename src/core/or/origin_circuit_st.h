@@ -11,6 +11,8 @@
 
 #include "core/or/circuit_st.h"
 
+#include "core/crypto/hs_dos_crypto.h"
+
 struct onion_queue_t;
 
 /**
@@ -129,6 +131,29 @@ struct origin_circuit_t {
   /** Holds hidden service identifier on either client or service side. This
    * is for both introduction and rendezvous circuit. */
   struct hs_ident_circuit_t *hs_ident;
+
+  /* Size of the client/service token batch */
+  int batch_size;
+  /* Array of client tokens waiting for signature of size real_batch_size
+   * TODO free adequately*/
+  hs_dos_token_t **client_token;
+  /* Array of signature tokens waiting for signature of size real_batch_size
+   * TODO free adequately*/
+  smartlist_t *service_token;
+  /* Boolean for the client to determine whether TOKEN1 cells were sent */
+  unsigned int token1_cells_sent : 1;
+  /* Boolean for the service to determine
+   * whether the first TOKEN1 cell was received */
+  unsigned int token1_cells_initiated : 1;
+  /* Boolean for the client to determine
+   * whether the first TOKEN2 cell was received */
+  unsigned int token2_cells_initiated : 1;
+  /* Number of signed tokens the client did receive after the request */
+  int cur_size;
+  /* The proof the service sent back for the batch */
+  hs_dos_proof_t *dleq_proof;
+  /* The pk the service used for the batch sent back */
+  EC_POINT *dleq_pk;
 
   /** Holds the data that the entry guard system uses to track the
    * status of the guard this circuit is using, and thereby to determine

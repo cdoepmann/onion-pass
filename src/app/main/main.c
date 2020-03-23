@@ -71,6 +71,7 @@
 #include "lib/encoding/confline.h"
 #include "lib/evloop/timers.h"
 #include "lib/crypt_ops/crypto_init.h"
+#include "core/crypto/hs_dos_crypto.h"
 #include "lib/version/torversion.h"
 
 #include <event2/event.h>
@@ -650,6 +651,11 @@ tor_init(int argc, char *argv[])
                          options->AccelName,
                          options->AccelDir)) {
     log_err(LD_BUG, "Unable to initialize OpenSSL. Exiting.");
+    return -1;
+  }
+
+  if (hs_dos_init_curve()) {
+    log_err(LD_BUG, "Unable to initialize HS Dos crypto curve. Exiting.");
     return -1;
   }
 

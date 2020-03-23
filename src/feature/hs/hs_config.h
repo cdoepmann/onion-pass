@@ -16,6 +16,18 @@
 /* Maximum number of intro points per version 3 services. */
 #define HS_CONFIG_V3_MAX_INTRO_POINTS 20
 
+/* Onion Service DoS Defenses Default Values. Min/Max values are inclusive. */
+#define HS_CONFIG_V3_HS_DOS_DEFENSE_DEFAULT 0
+#define HS_CONFIG_V3_HS_DOS_DEFENSE_TOKEN_NUMBER_DEFAULT 30
+#define HS_CONFIG_V3_HS_DOS_DEFENSE_TOKEN_NUMBER_MIN 1
+#define HS_CONFIG_V3_HS_DOS_DEFENSE_TOKEN_NUMBER_MAX 100
+#define HS_CONFIG_V3_HS_DOS_DEFENSE_RATE_PER_SEC_DEFAULT 25
+#define HS_CONFIG_V3_HS_DOS_DEFENSE_RATE_PER_SEC_MIN 0
+#define HS_CONFIG_V3_HS_DOS_DEFENSE_RATE_PER_SEC_MAX INT32_MAX
+#define HS_CONFIG_V3_HS_DOS_DEFENSE_BURST_PER_SEC_DEFAULT 200
+#define HS_CONFIG_V3_HS_DOS_DEFENSE_BURST_PER_SEC_MIN 0
+#define HS_CONFIG_V3_HS_DOS_DEFENSE_BURST_PER_SEC_MAX INT32_MAX
+
 /* API */
 
 int hs_config_service_all(const or_options_t *options, int validate_only);

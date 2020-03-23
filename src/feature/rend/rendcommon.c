@@ -820,6 +820,14 @@ rend_process_relay_cell(circuit_t *circ, const crypt_path_t *layer_hint,
       if (origin_circ)
         r = hs_client_receive_rendezvous_acked(origin_circ,payload,length);
       break;
+    case RELAY_COMMAND_TOKEN1:
+      if (origin_circ)
+        r = hs_service_receive_token1(origin_circ,payload,length);
+      break;
+    case RELAY_COMMAND_TOKEN2:
+      if (origin_circ)
+        r = hs_client_receive_token2(origin_circ,payload,length);
+      break;
     default:
       tor_fragile_assert();
   }

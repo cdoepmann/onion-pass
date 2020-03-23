@@ -1090,6 +1090,15 @@ struct or_options_t {
   /** Autobool: Do we refuse single hop client rendezvous? */
   int DoSRefuseSingleHopClientRendezvous;
 
+  /**This is used to check whether a client is configurede such that
+   * the tor process should try to retrieve tokens from a hidden service 
+   * after a valid redenzvous2 cell has been retireved (that is after a
+   * successful connection attempt to the service) */
+  int HsDoSRetrieveTokens;
+
+  /**This is the directory used to store client tokens if enabled */
+  char *HsDoSClientDir;
+
   /** Interval: how long without activity does it take for a client
    * to become dormant?
    **/

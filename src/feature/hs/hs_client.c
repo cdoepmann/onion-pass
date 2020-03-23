@@ -37,17 +37,317 @@
 #include "lib/crypt_ops/crypto_rand.h"
 #include "lib/crypt_ops/crypto_util.h"
 
+#include "core/or/relay.h"
+#include "lib/crypt_ops/crypto_ed25519.h"
+
 #include "core/or/cpath_build_state_st.h"
 #include "feature/dircommon/dir_connection_st.h"
 #include "core/or/entry_connection_st.h"
 #include "core/or/extend_info_st.h"
 #include "core/or/origin_circuit_st.h"
+#include <sys/stat.h>
 
 /* Client-side authorizations for hidden services; map of service identity
  * public key to hs_client_service_authorization_t *. */
 static digest256map_t *client_auths = NULL;
 
+/* We store all tokens retrieved in this map using identity_pk as key
+ * TODO: Make this permanent, that is store tokens on disk
+ * and reload them at startup.
+ * TODO: Run cleanup from time to time to remove old invalidated tokens */
+static digest256map_t *spendable_tokens = NULL;
+
 #include "trunnel/hs/cell_introduce1.h"
+
+/* Remove the file at filename
+ * Logs errors except file does not exist */
+static void remove_file(const char *filename)
+{
+  if (filename && tor_unlink(filename) != 0 && errno != ENOENT) {
+    log_warn(LD_FS, "Couldn't unlink %s: %s",
+               filename, strerror(errno));
+  }
+}
+
+/* Returns the token batch stored in file fname
+ * Return NULL on error */
+static hs_dos_token_batch_t *load_token_batch(const char *fname,
+                                              ed25519_public_key_t service_key)
+{
+  hs_dos_token_batch_t *batch = NULL;
+  smartlist_t *lines = NULL;
+  hs_dos_storable_token_t *tok = NULL;
+  int lines_len = 0;
+  struct stat st;
+  char *content = NULL;
+  char *line = NULL;
+  EC_POINT *dleq_pk = NULL;
+
+  tor_assert(fname);
+
+  if (!get_options()->HsDoSClientDir){
+    return NULL;
+  }
+
+  dleq_pk = EC_POINT_new(hs_dos_get_group());
+  tor_assert(dleq_pk);
+
+  lines = smartlist_new();
+  st.st_size = 0;
+  content = read_file_to_str(fname, RFTS_BIN|RFTS_IGNORE_MISSING, &st);
+  if (!content) {
+    goto err;
+  }
+  /* Not even enough bytes for a dleq public key */
+  if (st.st_size < HS_DOS_B64_P_LEN-1){
+    goto err;
+  }
+  lines_len = smartlist_split_string(lines, content, "\n",
+                                                      SPLIT_SKIP_SPACE, 0);
+  /* Not enough lines to contain dleq_pk and at least one token */
+  if (lines_len<2){
+    goto err;
+  }
+  line = smartlist_get(lines, 0);
+  if (hs_dos_b64_decode_point(dleq_pk, line))
+    goto err;
+  // smartlist_remove(lines, line);
+  smartlist_del(lines, 0);
+  batch = hs_dos_token_batch_t_new(service_key, dleq_pk);
+
+  /* Add the actual tokens */
+  SMARTLIST_FOREACH_BEGIN(lines, char*, l){
+    /* Just needed when we tamper with the stored tokens file */
+    if (0 == strcmp(l, ""))
+      continue;
+    tok = hs_dos_storable_token_t_new();
+    if (hs_dos_b64_decode_token(tok, l)){
+      goto err;
+    }
+    smartlist_add(batch->storable_tokens, tok);
+  }SMARTLIST_FOREACH_END(l);
+
+  EC_POINT_free(dleq_pk);
+  dleq_pk = NULL;
+  tor_free(content);
+  SMARTLIST_FOREACH(lines, char*, l, tor_free(l));
+  smartlist_free(lines); //free elements!
+  return batch;
+
+  err:
+    remove_file(fname);
+    hs_dos_storable_token_t_free(tok);
+    EC_POINT_free(dleq_pk);
+    dleq_pk = NULL;
+    hs_dos_token_storable_batch_t_free(batch);
+    tor_free(content);
+    if (lines)
+      SMARTLIST_FOREACH(lines, char*, l, tor_free(l));
+    smartlist_free(lines);
+    return NULL;
+};
+
+/* Stores the given batch in fname. Overwrite existing file.
+ * Return 0 on success, -1 on error. */
+static int write_token_batch(const char *fname,
+                             const hs_dos_token_batch_t *batch)
+{
+  int ret = -1;
+  char *b64_dleq_pk = NULL;
+  smartlist_t *encoded_batch = NULL;
+  char *b64_batch = NULL;
+
+  tor_assert(fname);
+  tor_assert(batch);
+  tor_assert(batch->dleq_pk);
+  tor_assert(batch->storable_tokens);
+
+  if (!get_options()->HsDoSClientDir){
+    return -1;
+  }
+
+  if (batch->storable_tokens->num_used < 1){
+    remove_file(fname);
+    return -1;
+  }
+
+  b64_dleq_pk = tor_malloc(HS_DOS_B64_P_LEN);
+  encoded_batch = smartlist_new();
+
+  if (hs_dos_b64_encode_point(b64_dleq_pk, batch->dleq_pk)<HS_DOS_B64_P_LEN-1){
+    tor_free(b64_dleq_pk);
+    goto err;
+  }
+  smartlist_add(encoded_batch, b64_dleq_pk);
+
+  SMARTLIST_FOREACH_BEGIN(batch->storable_tokens,
+                          const hs_dos_storable_token_t*,
+                          tok){
+    char *b64_tok = tor_malloc(HS_DOS_B64_TOK_LEN);
+    if (hs_dos_b64_encode_token(b64_tok, tok)<HS_DOS_B64_TOK_LEN-1){
+      tor_free(b64_tok);
+      goto err;
+    }
+    smartlist_add(encoded_batch, b64_tok);
+  }SMARTLIST_FOREACH_END(tok);
+
+  b64_batch = smartlist_join_strings(encoded_batch, "\n", 0, NULL);
+  if (!b64_batch)
+    goto err;
+
+  if (write_str_to_file(fname, b64_batch, 1))
+    goto err;
+
+  ret = 0;
+  err:
+    tor_free(b64_batch);
+    SMARTLIST_FOREACH(encoded_batch, char*, l, tor_free(l));
+    smartlist_free(encoded_batch);
+    return ret;
+};
+
+/* Reads all stored tokens from HsDoSClientDir
+ * Removes empty or unreadable files. */
+void sync_spendable_tokens(void)
+{
+  ed25519_public_key_t service_key;
+  char *fname;
+
+  if (!get_options()->HsDoSClientDir){
+    return;
+  }
+  if (spendable_tokens)
+    return;
+
+  if (!spendable_tokens){
+    spendable_tokens = digest256map_new();
+  }
+  smartlist_t *service_list = tor_listdir(get_options()->HsDoSClientDir);
+  SMARTLIST_FOREACH_BEGIN(service_list, const char*, onion_address){
+    fname = hs_path_from_filename(get_options()->HsDoSClientDir,
+                                  onion_address);
+    if (hs_parse_address(onion_address, &service_key, NULL, NULL))
+      remove_file(fname);
+    hs_dos_token_batch_t *batch = load_token_batch(fname, service_key);
+    if (batch){
+      digest256map_set(spendable_tokens, service_key.pubkey, batch);
+    }
+  }SMARTLIST_FOREACH_END(onion_address);
+  return;
+};
+
+/* Return 0 if tokens for this DLEQ PK and identity key of the service
+ * are available. Return 1 if not, -1 on error. */
+static int tokens_available(const ed25519_public_key_t identity_pk,
+                            const EC_POINT *dleq_pk)
+{
+  hs_dos_token_batch_t *batch = NULL;
+  tor_assert(dleq_pk);
+  if (!spendable_tokens)
+    sync_spendable_tokens();
+  if (!spendable_tokens)
+    return -1;
+  batch = digest256map_get(spendable_tokens, identity_pk.pubkey);
+  if (batch){
+    if (!hs_dos_points_cmp(batch->dleq_pk, dleq_pk) &&
+        batch->storable_tokens->num_used>0){
+          return 0;
+    }
+  }
+  return 1;
+};
+
+/* Remove a storable token from the spendable tokens map and returns a pointer
+ * to the token. May return NULL, if no token available! 
+ * Make DLEQ pk point to the point used for token generation */
+hs_dos_storable_token_t
+*hs_client_pop_spendable_token(const ed25519_public_key_t identity_pk,
+                     const EC_POINT *dleq_pk)
+{
+  hs_dos_storable_token_t *ret = NULL;
+  hs_dos_token_batch_t *batch = NULL;
+  char *fname = NULL;
+  char onion_address[HS_SERVICE_ADDR_LEN_BASE32+1];
+
+  tor_assert(dleq_pk);
+
+  if (!spendable_tokens)
+    sync_spendable_tokens();
+  if (!spendable_tokens)
+    return NULL;
+
+  batch = digest256map_get(spendable_tokens, identity_pk.pubkey);
+  if (!batch)
+    return NULL;
+  if (hs_dos_points_cmp(batch->dleq_pk, dleq_pk))
+    return NULL;
+  ret = smartlist_pop_last(batch->storable_tokens);
+  if (get_options()->HsDoSClientDir){
+    hs_build_address(&identity_pk, HS_VERSION_THREE, onion_address);
+    fname = hs_path_from_filename(get_options()->HsDoSClientDir,
+                                    onion_address);
+    if (ret){
+      write_token_batch(fname, batch);
+    }
+    else{
+      remove_file(fname);
+    }
+    tor_free(fname);
+  }
+  return ret;
+};
+
+/* Adds tokens to the spendable token map. */
+void hs_client_add_spendable_tokens(
+                          const ed25519_public_key_t identity_pk,
+                          const EC_POINT *dleq_pk,
+                          const hs_dos_token_t **tokens,
+                          int batch_size)
+{
+  hs_dos_token_batch_t *batch = NULL;
+  char *fname = NULL;
+  char onion_address[HS_SERVICE_ADDR_LEN_BASE32+1];
+
+  tor_assert(tokens);
+  tor_assert(dleq_pk);
+
+  if (spendable_tokens){
+    batch = digest256map_get(spendable_tokens, identity_pk.pubkey);
+    if (batch){
+      if (hs_dos_points_cmp(batch->dleq_pk, dleq_pk)){
+        /* Discard the old tokens ;-)
+        * TODO: We should also do this if tokens are too old.
+        * TODO: Remove tokens on disk to if stored */
+        hs_dos_token_storable_batch_t_free(batch);
+        batch = hs_dos_token_batch_t_new(identity_pk, dleq_pk);
+        digest256map_remove(spendable_tokens, identity_pk.pubkey);
+        digest256map_set(spendable_tokens, identity_pk.pubkey, batch);
+      }
+    }
+  }
+  else{
+    sync_spendable_tokens();
+    if (!spendable_tokens)
+      spendable_tokens = digest256map_new();
+  }
+  if (!batch){
+    batch = hs_dos_token_batch_t_new(identity_pk, dleq_pk);
+    digest256map_set(spendable_tokens, identity_pk.pubkey, batch);
+  }
+  for (int i=0; i<batch_size; i++){
+    hs_dos_storable_token_t *s_tok = hs_dos_get_storable_token(tokens[i]);
+    smartlist_add(batch->storable_tokens, s_tok);
+  }
+  /* Store tokens on disk */
+  if (get_options()->HsDoSClientDir){
+    hs_build_address(&identity_pk, HS_VERSION_THREE, onion_address);
+    fname = hs_path_from_filename(get_options()->HsDoSClientDir,
+                                    onion_address);
+    write_token_batch(fname, batch);
+    tor_free(fname);
+  }
+  return;
+};
 
 /* Return a human-readable string for the client fetch status code. */
 static const char *
@@ -572,6 +872,8 @@ send_introduce1(origin_circuit_t *intro_circ,
   char onion_address[HS_SERVICE_ADDR_LEN_BASE32 + 1];
   const ed25519_public_key_t *service_identity_pk = NULL;
   const hs_desc_intro_point_t *ip;
+  hs_dos_storable_token_t *tok = NULL;
+  const EC_POINT *dleq_pk = NULL;
 
   tor_assert(rend_circ);
   if (intro_circ_is_ok(intro_circ) < 0) {
@@ -612,9 +914,29 @@ send_introduce1(origin_circuit_t *intro_circ,
     goto perm_err;
   }
 
+  /* get spendable token and put into INTRO1 cell - may be NULL */
+  if (desc->encrypted_data.hs_dos_defenses_enabled){
+    dleq_pk = (const EC_POINT*)
+                        desc->encrypted_data.hs_dos_defenses->dleq_public_key;
+    tok = hs_client_pop_spendable_token(
+                                  intro_circ->hs_ident->identity_pk, dleq_pk);
+    if (!tok){
+      dleq_pk = (const EC_POINT*)
+              desc->encrypted_data.hs_dos_defenses->previous_dleq_public_key;
+      tok = hs_client_pop_spendable_token(
+                                  intro_circ->hs_ident->identity_pk, dleq_pk);
+    }
+    if (!tok)
+      dleq_pk = NULL;
+  }
+
   /* Send the INTRODUCE1 cell. */
-  if (hs_circ_send_introduce1(intro_circ, rend_circ, ip,
-                              desc->subcredential) < 0) {
+  if (hs_circ_send_introduce1(intro_circ,
+                              rend_circ,
+                              ip,
+                              desc->subcredential,
+                              dleq_pk,
+                              tok) < 0) {
     if (TO_CIRCUIT(intro_circ)->marked_for_close) {
       /* If the introduction circuit was closed, we were unable to send the
        * cell for some reasons. In any case, the intro circuit has to be
@@ -667,7 +989,9 @@ send_introduce1(origin_circuit_t *intro_circ,
   status = -1;
 
  end:
+  hs_dos_storable_token_t_free(tok);
   memwipe(onion_address, 0, sizeof(onion_address));
+  printf("send INTRO1 cell status: %d\n", status);
   return status;
 }
 
@@ -1089,6 +1413,37 @@ handle_introduce_ack(origin_circuit_t *circ, const uint8_t *payload,
   return ret;
 }
 
+/* Request tokens from the service at this circuit
+ * Potentially may send and retrieve several TOKEN1 cells. */
+void hs_client_request_tokens(origin_circuit_t *rdv_circ,
+                              unsigned int batch_size,
+                              uint8_t pow_len,
+                              const uint8_t *pow)
+{
+  tor_assert(rdv_circ);
+  tor_assert(rdv_circ->hs_ident);
+
+  if (pow_len>0)
+    tor_assert(pow);
+
+  rdv_circ->batch_size = (int) batch_size;
+  rdv_circ->token1_cells_sent = 0;
+  rdv_circ->client_token = hs_dos_tokens_new(rdv_circ->batch_size);
+  /* build and send the cells */
+  if (hs_dos_prepare_n_tokens(rdv_circ->client_token, rdv_circ->batch_size))
+    goto err;
+  if (hs_circ_send_token1_cells(rdv_circ, pow_len, pow)){
+    goto err;
+  }
+
+  rdv_circ->token1_cells_sent = 1;
+  return;
+
+  err:
+    unset_token_request(rdv_circ);
+    return;
+};
+
 /* Called when we get a RENDEZVOUS2 cell on the rendezvous circuit circ. The
  * encoded cell is in payload of length payload_len. Return 0 on success or a
  * negative value on error. On error, the circuit is marked for close. */
@@ -1102,6 +1457,8 @@ handle_rendezvous2(origin_circuit_t *circ, const uint8_t *payload,
   uint8_t handshake_info[CURVE25519_PUBKEY_LEN + sizeof(auth_mac)] = {0};
   hs_ntor_rend_cell_keys_t keys;
   const hs_ident_circuit_t *ident;
+  const hs_descriptor_t *desc;
+  const or_options_t *options;
 
   tor_assert(circ);
   tor_assert(payload);
@@ -1141,6 +1498,36 @@ handle_rendezvous2(origin_circuit_t *circ, const uint8_t *payload,
     goto err;
   }
   /* Success. Hidden service connection finalized! */
+
+  /* Check if we want to retrieve new tokens from this service */
+  options = get_options();
+  desc = hs_cache_lookup_as_client(&circ->hs_ident->identity_pk);
+
+  /* loading configs and parsing hs descriptor */
+  if (options &&
+      options->HsDoSRetrieveTokens &&
+      desc &&
+      desc->encrypted_data.hs_dos_defenses_enabled){
+    /* CURRENTLY WE DO NOT REALLY HANDLE CHALLENGES */
+    uint8_t pow_len = 0;
+    const uint8_t *pow = NULL;
+    tor_assert(desc->encrypted_data.hs_dos_defenses);
+    tor_assert(desc->encrypted_data.hs_dos_defenses->dleq_public_key);
+    /* Should only request new tokens when there are none left. */
+    if(tokens_available(
+                      circ->hs_ident->identity_pk,
+                      desc->encrypted_data.hs_dos_defenses->dleq_public_key)){
+      log_info(LD_REND, "Requesting HS DoS tokens...");
+      hs_client_request_tokens(circ,
+                desc->encrypted_data.hs_dos_defenses->hs_dos_max_token_number,
+                pow_len,
+                pow);
+    }
+    else{
+      log_info(LD_REND, "Not requesting HS DoS tokens. Still have old tokens");
+    }
+  }
+
   ret = 0;
   goto end;
 
@@ -1148,6 +1535,152 @@ handle_rendezvous2(origin_circuit_t *circ, const uint8_t *payload,
   circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_REASON_TORPROTOCOL);
  end:
   memwipe(&keys, 0, sizeof(keys));
+  return ret;
+}
+
+/* Return 0 if cell is valid for current circuit state,
+ * 1 if not, -1 on error */
+static int
+validate_token2_cell(origin_circuit_t *circ,
+                     hs_cell_token2_data_t *data)
+{
+  tor_assert(circ);
+  tor_assert(data);
+  
+  if (!circ->token1_cells_sent)
+    return 1;
+  
+  if (data->is_first && (data->batch_size != circ->batch_size ||
+                         circ->token2_cells_initiated ||
+                         data->token_num > data->batch_size)){
+    return 1;
+  }
+  else if (!data->is_first && (data->token_num+circ->cur_size >
+                                                          circ->batch_size ||
+                               !circ->token2_cells_initiated)){
+    return 1;
+  }
+  else{
+    return 0;
+  }
+};
+
+/* Called when we get a TOKEN2 cell on the rendezvous circuit circ. The
+ * encoded cell is in payload of length payload_len. Return 0 on success or a
+ * negative value on error. On error, the circuit is marked for close. */
+STATIC int
+handle_token2(origin_circuit_t *circ, const uint8_t *payload,
+              size_t payload_len)
+{
+  int ret = -1;
+  const hs_ident_circuit_t *ident;
+  const hs_descriptor_t *desc;
+  hs_cell_token2_data_t data;
+  data.dleq_pk = NULL;
+  data.dleq_proof = NULL;
+  data.tokens = NULL;
+  data.payload = NULL;
+
+  tor_assert(circ);
+  tor_assert(payload);
+
+  /* Make things easier. */
+  ident = circ->hs_ident;
+  tor_assert(ident);
+
+  /* Populate the data structure with everything we need for the cell to be
+   * parsed, decrypted and key material computed correctly. */
+  if (hs_cell_parse_token2(circ, &data, payload, payload_len) < 0) {
+    goto err;
+  }
+
+  /* This should not happen, we close the circuit */
+  if (validate_token2_cell(circ, &data)){
+    log_warn(LD_REND, "Closing RENDEZVOUS circuit. TOKEN1 cell invalid.");
+    goto err;
+  }
+  tor_assert(circ->client_token);
+  
+  /* We have a new first reply */
+  if (data.is_first){
+    circ->dleq_proof = hs_dos_proof_t_new();
+    circ->dleq_pk = EC_POINT_new(hs_dos_get_group());
+    tor_assert(circ->dleq_pk);
+    hs_dos_decode_proof(circ->dleq_proof,
+                        (const unsigned char*) data.dleq_proof);
+    hs_dos_decode_ec_point(circ->dleq_pk, (const unsigned char*) data.dleq_pk);
+    desc = hs_cache_lookup_as_client(&ident->identity_pk);
+    if (!desc->encrypted_data.hs_dos_defenses_enabled ||
+        !desc->encrypted_data.hs_dos_defenses){
+      goto abort_request;
+    }
+    if (hs_dos_points_cmp(
+                desc->encrypted_data.hs_dos_defenses->dleq_public_key,
+                circ->dleq_pk) &&
+        hs_dos_points_cmp(
+                desc->encrypted_data.hs_dos_defenses->previous_dleq_public_key,
+                circ->dleq_pk)){
+      goto abort_request; 
+    }
+    circ->token2_cells_initiated = 1;
+  }
+
+  /* Hopefully batches are small enough, that this is not too slow;-) */
+  SMARTLIST_FOREACH_BEGIN(data.tokens, hs_dos_sig_token_t*, sig){
+    int found_seq = 0;
+    for (int i=0; i<circ->batch_size; i++){
+      if (sig->seq_num == circ->client_token[i]->seq_num){
+        circ->client_token[i]->oprf_out_blind_token = 
+                                                  sig->oprf_out_blind_token;
+        /* We pass ownership */
+        sig->oprf_out_blind_token = NULL;
+        found_seq = 1;
+        break;
+      }
+    }
+    if (!found_seq){
+      goto abort_request;
+    }
+  }SMARTLIST_FOREACH_END(sig);
+
+  /* Request is complete, we can handle it */
+  if (data.is_last){
+    /* TODO verify we received an accurate number of tokens */
+    if (hs_dos_verify_and_unblind_tokens(circ->dleq_proof,
+                                     circ->client_token,
+                                     circ->dleq_pk,
+                                     circ->batch_size)){
+      goto abort_request;
+    }
+    hs_client_add_spendable_tokens(ident->identity_pk,
+                                   circ->dleq_pk,
+                                   (const hs_dos_token_t **)circ->client_token,
+                                   circ->batch_size);
+    unset_token_request(circ);
+    ret = 0;
+    printf("Parsed TOKEN2 cells\n");
+  }
+
+  /* Success. */
+
+  ret = 0;
+  goto end;
+
+ abort_request:
+  unset_token_request(circ);
+ err:
+  circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_REASON_TORPROTOCOL);
+ end:
+  tor_free(data.dleq_pk);
+  tor_free(data.dleq_proof);
+  if (data.tokens){
+    SMARTLIST_FOREACH(data.tokens,
+                      hs_dos_sig_token_t*,
+                      sig_tok,
+                      hs_dos_sig_token_t_free(sig_tok));
+  }
+  smartlist_free(data.tokens);
+  memwipe(&data, 0, sizeof(data));
   return ret;
 }
 
@@ -1813,6 +2346,38 @@ hs_client_receive_rendezvous2(origin_circuit_t *circ,
  end:
   return ret;
 }
+
+/* Called when get a TOKEN2 cell on the rendezvous circuit circ.  Return
+ * 0 on success else a negative value is returned. The circuit will be closed
+ * on error. */
+int hs_client_receive_token2(origin_circuit_t *circ,
+                             const uint8_t *payload,
+                             size_t payload_len)
+{
+  int ret = -1;
+
+  tor_assert(circ);
+  tor_assert(payload);
+
+  /* Circuit can possibly be in both state because we could receive a
+   * RENDEZVOUS2 cell before the INTRODUCE_ACK has been received. */
+  if ((TO_CIRCUIT(circ)->purpose != CIRCUIT_PURPOSE_C_REND_JOINED) ||
+      (!circ->hs_ident)) {
+    log_warn(LD_PROTOCOL, "Unexpected TOKEN2 cell on circuit %u. "
+                          "Closing circuit.",
+             (unsigned int) TO_CIRCUIT(circ)->n_circ_id);
+    circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_REASON_TORPROTOCOL);
+    goto end;
+  }
+
+  log_info(LD_REND, "Got TOKEN2 cell from hidden service on circuit %u.",
+           TO_CIRCUIT(circ)->n_circ_id);
+
+  ret = handle_token2(circ, payload, payload_len);
+
+ end:
+  return ret;
+};
 
 /* Extend the introduction circuit circ to another valid introduction point
  * for the hidden service it is trying to connect to, or mark it and launch a

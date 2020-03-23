@@ -374,6 +374,9 @@ lookup_v3_desc_as_client(const uint8_t *key)
 
   tor_assert(key);
 
+  if (!hs_cache_v3_client){
+    return NULL;
+  }
   /* Do the lookup */
   cached_desc = digest256map_get(hs_cache_v3_client, key);
   if (!cached_desc) {

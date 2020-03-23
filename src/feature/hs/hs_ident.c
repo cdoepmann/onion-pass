@@ -10,8 +10,10 @@
 #include "lib/crypt_ops/crypto_util.h"
 #include "feature/hs/hs_ident.h"
 
+#include "core/crypto/hs_dos_crypto.h"
+
 /* Return a newly allocated circuit identifier. The given public key is copied
- * identity_pk into the identifier. */
+ * identity_pk into the identifier.*/
 hs_ident_circuit_t *
 hs_ident_circuit_new(const ed25519_public_key_t *identity_pk,
                      hs_ident_circuit_type_t circuit_type)

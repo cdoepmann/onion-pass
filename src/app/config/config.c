@@ -485,6 +485,14 @@ static config_var_t option_vars_[] = {
   VAR("HiddenServiceNumIntroductionPoints", LINELIST_S, RendConfigLines, NULL),
   VAR("HiddenServiceExportCircuitID", LINELIST_S,  RendConfigLines, NULL),
   VAR("HiddenServiceStatistics", BOOL, HiddenServiceStatistics_option, "1"),
+  VAR("HiddenServiceEnableHsDoSDefense", LINELIST_S, RendConfigLines, NULL),
+  VAR("HiddenServiceEnableHsDoSDefenseTokenNum", LINELIST_S, RendConfigLines, NULL),
+  VAR("HiddenServiceEnableHsDoSRatePerSec",
+      LINELIST_S, RendConfigLines, NULL),
+  VAR("HiddenServiceEnableHsDoSBurstPerSec",
+      LINELIST_S, RendConfigLines, NULL),
+  V(HsDoSRetrieveTokens,         BOOL,     "0"),
+  V(HsDoSClientDir,              STRING,   NULL),
   V(HidServAuth,                 LINELIST, NULL),
   V(ClientOnionAuthDir,          FILENAME, NULL),
   OBSOLETE("CloseHSClientCircuitsImmediatelyOnTimeout"),
@@ -4544,6 +4552,16 @@ options_validate(or_options_t *old_options, or_options_t *options,
     options->HardwareAccel = 1;
   if (options->AccelDir && !options->AccelName)
     REJECT("Can't use hardware crypto accelerator dir without engine name.");
+
+  if (!options->HsDoSRetrieveTokens && options->HsDoSClientDir){
+    log_warn(LD_CONFIG, "HsDoSClientDir was set but client side token usage"
+                        "is disabled. Ignore HsDoSClientDir");
+    options->HsDoSClientDir = NULL;
+  }
+  if (options->HsDoSRetrieveTokens && !options->HsDoSClientDir){
+    log_warn(LD_CONFIG, "HsDoSClientDir is not set but client side token usage"
+                        "is enabled. Tokens will not be persistent");
+  }
 
   if (options->PublishServerDescriptor)
     SMARTLIST_FOREACH(options->PublishServerDescriptor, const char *, pubdes, {

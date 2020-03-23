@@ -18,6 +18,17 @@
 #include "feature/hs/hs_ident.h"
 #include "feature/hs/hs_intropoint.h"
 
+#include <openssl/ec.h>
+#include <openssl/bn.h>
+#include <openssl/ossl_typ.h>
+#include <time.h>
+#include "lib/crypt_ops/crypto_digest.h"
+
+#include "core/crypto/hs_dos_crypto.h"
+#include "feature/hs/hs_dos.h"
+
+#include "lib/evloop/token_bucket.h"
+
 /* Trunnel */
 #include "trunnel/hs/cell_establish_intro.h"
 
@@ -241,6 +252,12 @@ typedef struct hs_service_config_t {
 
   /* Does this service export the circuit ID of its clients? */
   hs_circuit_id_protocol_t circuit_id_protocol;
+
+    /* Onion service HS DoS defenses. For token based access */
+  unsigned int hs_dos_defense_enabled : 1;
+  uint32_t hs_dos_token_num;
+  uint32_t hs_dos_rate_per_sec;
+  uint32_t hs_dos_burst_per_sec;
 } hs_service_config_t;
 
 /* Service state. */
@@ -290,6 +307,16 @@ typedef struct hs_service_t {
   /* Next descriptor. */
   hs_service_descriptor_t *desc_next;
 
+  /* Current HS dos handler. */
+  hs_dos_handler_t *cur_handler;
+
+  /* Previous HS dos handler. */
+  hs_dos_handler_t *prv_handler;
+
+  /**INTRODUCE2 cell bucket controlling how much introductions this service
+   * accepts. Only used if hs_dos_defenses are enable in config */
+  token_bucket_ctr_t introduce2_bucket;
+
   /* XXX: Credential (client auth.) #20700. */
 
 } hs_service_t;
@@ -326,9 +353,16 @@ void hs_service_circuit_has_opened(origin_circuit_t *circ);
 int hs_service_receive_intro_established(origin_circuit_t *circ,
                                          const uint8_t *payload,
                                          size_t payload_len);
+bool hs_dos_can_launch_rendezvous(hs_service_t *service,
+                                  const EC_POINT *dleq_pk,
+                                  const BIGNUM *token_rn,
+                                  const char *redemption_hmac);
 int hs_service_receive_introduce2(origin_circuit_t *circ,
                                   const uint8_t *payload,
                                   size_t payload_len);
+int hs_service_receive_token1(origin_circuit_t *circ,
+                              const uint8_t *payload,
+                              size_t payload_len);
 
 void hs_service_intro_circ_has_closed(origin_circuit_t *circ);
 
@@ -349,6 +383,9 @@ void hs_service_upload_desc_to_dir(const char *encoded_desc,
 
 hs_circuit_id_protocol_t
 hs_service_exports_circuit_id(const ed25519_public_key_t *pk);
+
+const EC_POINT *hs_service_get_current_dleq_pk(const hs_service_t *service);
+const EC_POINT *hs_service_get_previous_dleq_pk(const hs_service_t *service);
 
 #ifdef HS_SERVICE_PRIVATE
 
