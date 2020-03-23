@@ -21,6 +21,8 @@
 #include "feature/hs/hs_service.h"
 #include "feature/hs/hs_descriptor.h"
 
+#include <sys/resource.h>
+
 /**
  * Test if curve initializes*/
 static void test_hs_dos_init_curve(void *arg)
@@ -378,6 +380,136 @@ static void test_hs_dos_token_request(void *arg)
     hs_dos_terminate_curve();
 };
 
+/**
+ * Benchmark the token generation and redemption related functions for both
+ * client and server */
+static void test_hs_dos_token_benchmark(void *arg)
+{
+  (void) arg;
+
+  /* Benchmark: store values */
+  struct rusage before_u, after_u;
+  struct timeval result_u, result_s, result;
+
+  tor_assert(0 == hs_dos_init_curve());
+  hs_dos_handler_t *handler = hs_dos_handler_t_new();
+  tor_assert(handler);
+  int batch_size;
+  printf("Run this benchmark with different batch_size<=100. Also run with batch_size=1000 (to get a good average for redemption of tokens\n");
+  // char* b64_tokens;
+  const char *data = "test_req_binding_data";
+  size_t data_len = strlen(data);
+  char client_redemption_hmac[DIGEST256_LEN];
+  const EC_GROUP *ec = hs_dos_get_group();
+  tor_assert(ec);
+  EC_POINT *hs_pub_oprf_key = EC_POINT_new(ec), *generator = EC_POINT_new(ec);
+  tor_assert(hs_pub_oprf_key); tor_assert(generator);
+  tor_assert(0 == hs_dos_get_descriptor_points(hs_pub_oprf_key, generator, handler));
+  hs_dos_proof_t *hs_proof;// = hs_dos_proof_t_new();
+  hs_dos_token_t **client_token;// = hs_dos_tokens_new(batch_size);
+  hs_dos_sig_token_t **hs_token;// = hs_dos_sig_tokens_new(batch_size);
+
+  int iterations = 1000;
+
+  /*---------------------
+    Memory leaks!!! ;-)
+   ---------------------*/
+
+  for (batch_size = 1; batch_size<=1000; batch_size=(batch_size+10)-(batch_size%10)){
+    char filename[1024];
+    snprintf(filename, 1024, "../Evaluation/iterations_%d_batch_size_%d", iterations, batch_size);
+    FILE *f = fopen(filename, "w");
+    printf("%d iterations of Token Retrieval with batch_size %d:\n", iterations, batch_size);
+    fprintf(f, "Preparation time (Client), Signature time (Server), DLEQ verification (Client)\n");
+    for (int j=0; j<iterations; j++){
+      hs_proof = hs_dos_proof_t_new();
+      client_token = hs_dos_tokens_new(batch_size);
+      hs_token = hs_dos_sig_tokens_new(batch_size);
+
+      getrusage(RUSAGE_SELF, &before_u);
+      tt_assert(0 == hs_dos_prepare_n_tokens(client_token, batch_size));
+      getrusage(RUSAGE_SELF, &after_u);
+
+      timersub(&after_u.ru_utime, &before_u.ru_utime, &result_u);
+      timersub(&after_u.ru_stime, &before_u.ru_stime, &result_s);
+      timeradd(&result_u, &result_s, &result);
+      fprintf(f, "%ld, ", result.tv_usec);
+
+      // Now the client sends the tokens to be signed
+      for (int i=0; i<batch_size; i++){
+        tt_assert(client_token[i]->blind_token);
+        EC_POINT_free(hs_token[i]->blind_token);
+        hs_token[i]->blind_token = client_token[i]->blind_token;
+      }
+
+      getrusage(RUSAGE_SELF, &before_u);
+      tt_assert(0 == hs_dos_sign_n_tokens(hs_proof, hs_token, batch_size, handler));
+      getrusage(RUSAGE_SELF, &after_u);
+
+      timersub(&after_u.ru_utime, &before_u.ru_utime, &result_u);
+      timersub(&after_u.ru_stime, &before_u.ru_stime, &result_s);
+      timeradd(&result_u, &result_s, &result);
+      fprintf(f, "%ld, ", result.tv_usec);
+
+      //Now the server sends back signatures and proof for the tokens
+      for (int i=0; i<batch_size; i++){
+        tt_assert(hs_token[i]->oprf_out_blind_token);
+        EC_POINT_free(client_token[i]->oprf_out_blind_token);
+        client_token[i]->oprf_out_blind_token = hs_token[i]->oprf_out_blind_token;
+      }
+
+      getrusage(RUSAGE_SELF, &before_u);
+      tt_assert(0 == hs_dos_verify_and_unblind_tokens(hs_proof, client_token, hs_pub_oprf_key, batch_size));
+      getrusage(RUSAGE_SELF, &after_u);
+
+      timersub(&after_u.ru_utime, &before_u.ru_utime, &result_u);
+      timersub(&after_u.ru_stime, &before_u.ru_stime, &result_s);
+      timeradd(&result_u, &result_s, &result);
+      fprintf(f, "%ld\n", result.tv_usec);
+    }
+
+    // Use tokens for redemption...
+    if (batch_size == 1000){
+      fclose(f);
+      snprintf(filename, 1023, "../Evaluation/redemption_benchmark.txt");
+      f = fopen(filename, "w");
+      printf("%d iterations of Token Redemption (1 single token):\n", batch_size);
+      fprintf(f, "Preparation time (Client), Redemption time (Server)\n");
+      for (int i=0; i<batch_size; i++){
+        const BIGNUM *client_t_rn = client_token[i]->token_rn;
+        const EC_POINT *signature = client_token[i]->signed_token;
+
+        getrusage(RUSAGE_SELF, &before_u);
+        tt_assert(0 == hs_dos_prepare_redemption(client_redemption_hmac, client_t_rn, signature, data, data_len));
+        getrusage(RUSAGE_SELF, &after_u);
+        timersub(&after_u.ru_utime, &before_u.ru_utime, &result_u);
+        timersub(&after_u.ru_stime, &before_u.ru_stime, &result_s);
+        timeradd(&result_u, &result_s, &result);
+        fprintf(f, "%ld, ", result.tv_usec);
+
+        getrusage(RUSAGE_SELF, &before_u);
+        tt_assert(0 == hs_dos_redeem_token(client_redemption_hmac, client_t_rn, data, data_len, handler));
+        getrusage(RUSAGE_SELF, &after_u);
+        timersub(&after_u.ru_utime, &before_u.ru_utime, &result_u);
+        timersub(&after_u.ru_stime, &before_u.ru_stime, &result_s);
+        timeradd(&result_u, &result_s, &result);
+        fprintf(f, "%ld\n", result.tv_usec);
+      }
+    }
+    if (batch_size==100){
+      batch_size = 990;//will result in 1000
+      iterations = 1;
+    }
+    fclose(f);
+  }
+  
+  done:
+    /* Lots of memory leaks.... */
+    hs_dos_proof_t_free(hs_proof);
+    hs_dos_handler_t_free(handler);
+    hs_dos_terminate_curve();
+};
+
 struct testcase_t hs_dos_tests[] = {
   { "hs_dos_init_curve", test_hs_dos_init_curve, TT_FORK, NULL, NULL },
   { "hs_dos_load_handler", test_hs_dos_load_handler, TT_FORK, NULL, NULL },
@@ -388,5 +520,6 @@ struct testcase_t hs_dos_tests[] = {
   { "hs_dos_token_validity", test_hs_dos_token_validity, TT_FORK, NULL, NULL },
   { "hs_dos_token_cycle", test_hs_dos_token_cycle, TT_FORK, NULL, NULL },
   { "hs_dos_token_request", test_hs_dos_token_request, TT_FORK, NULL, NULL },
+  { "hs_dos_token_benchmark", test_hs_dos_token_benchmark, TT_FORK, NULL, NULL },
   END_OF_TESTCASES
 };
