@@ -3026,6 +3026,41 @@ The following options are used to configure a hidden service.
     Number of introduction points the hidden service will have. You can't
     have more than 10 for v2 service and 20 for v3. (Default: 3)
 
+[[HiddenServiceEnableHsDoSDefense]] **HiddenServiceEnableHsDoSDefense** **0**|**1**::
+    Enable DoS defense at the onion service. When this is enabled, the
+    number of tokens parameter (see below) will be used to set the maximum number of
+    tokens a client may retrieve for one correct solution of the challenge.
+
+[[HiddenServiceEnableHsDoSDefenseTokenNum]] **HiddenServiceEnableHsDoSDefenseTokenNum** __NUM__::
+    The allowed number of unsigned blinded tokens a client may send to
+    retrieve a signature for. If this option is 0, it effectively disables
+    the defenses. (Default: 30, Maximum: 100)
+
+[[HiddenServiceEnableHsDoSRatePerSec]] **HiddenServiceEnableHsDoSRatePerSec** __NUM__::
+    The allowed client introduction rate per second at the hidden service.
+    The service will not accept more cells without valid tokens.
+    Introduction rate including cells with valid tokens may surpass this value.
+    If this option is 0, it is considered infinite and thus if
+    **HiddenServiceEnableHsDoSDefense** is set, it then effectively
+    disables the defenses. (Default: 25)
+
+[[HiddenServiceEnableHsDoSBurstPerSec]] **HiddenServiceEnableHsDoSBurstPerSec** __NUM__::
+    The allowed client introduction burst per second at the hidden service.
+    The service will not accept more cells without valid tokens.
+    Introduction rate including cells with valid tokens may surpass this value.
+    If this option is 0, it is considered infinite and thus if
+    **HiddenServiceEnableHsDoSDefense** is set, it then effectively
+    disables the defenses. (Default: 200)
+
+[[HsDoSRetrieveTokens]] **HsDoSRetrieveTokens** **0**|**1**::
+    Enable token retrieval on the client side from HSv3
+    if those have it enabled (Default: disabled)
+
+[[HsDoSClientDir]] **HsDoSClientDir** __DIRECTORY__::
+    Store data files for a hidden service client in DIRECTORY.
+    If DIRECTORY does not exist, Tor will create it.
+    (Currently used to store tokens persistent.)
+
 [[HiddenServiceSingleHopMode]] **HiddenServiceSingleHopMode** **0**|**1**::
     **Experimental - Non Anonymous** Hidden Services on a tor instance in
     HiddenServiceSingleHopMode make one-hop (direct) circuits between the onion
