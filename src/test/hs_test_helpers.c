@@ -5,9 +5,11 @@
 #include "lib/crypt_ops/crypto_ed25519.h"
 #include "test/test.h"
 #include "feature/nodelist/torcert.h"
+#include <openssl/ec.h>
 
 #include "feature/hs/hs_common.h"
 #include "test/hs_test_helpers.h"
+#include "core/crypto/hs_dos_crypto.h"
 
 hs_desc_intro_point_t *
 hs_helper_build_intro_point(const ed25519_keypair_t *signing_kp, time_t now,
@@ -211,6 +213,7 @@ void
 hs_helper_desc_equal(const hs_descriptor_t *desc1,
                      const hs_descriptor_t *desc2)
 {
+  BN_CTX *ctx = NULL;
   /* Plaintext data section. */
   tt_int_op(desc1->plaintext_data.version, OP_EQ,
             desc2->plaintext_data.version);
@@ -274,6 +277,57 @@ hs_helper_desc_equal(const hs_descriptor_t *desc1,
          i++) {
       tt_str_op(smartlist_get(desc1->encrypted_data.intro_auth_types, i),OP_EQ,
                 smartlist_get(desc2->encrypted_data.intro_auth_types, i));
+    }
+  }
+
+  /* dos defenses */
+  {
+    hs_desc_dos_defense_t *def1 = NULL;
+    hs_desc_dos_defense_t *def2 = NULL;
+    if (desc1->encrypted_data.hs_dos_defenses_enabled){
+      def1 = desc1->encrypted_data.hs_dos_defenses;
+      tt_assert(def1);
+      tt_assert(desc2->encrypted_data.hs_dos_defenses_enabled);
+      def2 = desc2->encrypted_data.hs_dos_defenses;
+      tt_assert(def2);
+      ctx = BN_CTX_new();
+      tor_assert(ctx);
+      tt_assert(def1->dleq_generator);
+      tt_assert(def2->dleq_generator);
+      tt_assert(def1->dleq_public_key);
+      tt_assert(def2->dleq_public_key);
+      tt_assert(0 == EC_POINT_cmp(hs_dos_get_group(),
+                                  def1->dleq_generator,
+                                  def2->dleq_generator,
+                                  ctx));
+      tt_assert(0 == EC_POINT_cmp(hs_dos_get_group(),
+                                  def1->dleq_public_key,
+                                  def2->dleq_public_key,
+                                  ctx));
+      if (def1->previous_generator
+          || def2->previous_generator
+          || def1->previous_dleq_public_key
+          || def2->previous_dleq_public_key)
+      {
+        tt_assert(def1->previous_generator);
+        tt_assert(def2->previous_generator);
+        tt_assert(def1->previous_dleq_public_key);
+        tt_assert(def2->previous_dleq_public_key);
+        tt_assert(0 == EC_POINT_cmp(hs_dos_get_group(),
+                                    def1->previous_dleq_public_key,
+                                    def2->previous_dleq_public_key,
+                                    ctx));
+        tt_assert(0 == EC_POINT_cmp(hs_dos_get_group(),
+                                    def1->previous_generator,
+                                    def2->previous_generator,
+                                    ctx));
+      }
+      
+    }
+    else{
+      tt_assert(!desc1->encrypted_data.hs_dos_defenses);
+      tt_assert(!desc2->encrypted_data.hs_dos_defenses_enabled);
+      tt_assert(!desc2->encrypted_data.hs_dos_defenses);
     }
   }
 
@@ -350,6 +404,7 @@ hs_helper_desc_equal(const hs_descriptor_t *desc1,
   }
 
  done:
+  BN_CTX_free(ctx);
   ;
 }
 

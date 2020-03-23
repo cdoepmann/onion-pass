@@ -23,6 +23,9 @@
 #include "test/log_test_helpers.h"
 #include "test/rng_test_helpers.h"
 
+#include "feature/hs/hs_config.h"
+#include "core/crypto/hs_dos_crypto.h"
+
 #ifdef HAVE_CFLAG_WOVERLENGTH_STRINGS
 DISABLE_GCC_WARNING(overlength-strings)
 /* We allow huge string constants in the unit tests, but not in the code
@@ -208,6 +211,67 @@ test_encode_descriptor(void *arg)
     tor_free(encoded);
   }
  done:
+  hs_descriptor_free(desc);
+}
+
+static void
+test_descriptor_hs_dos(void *arg)
+{
+  int ret;
+  ed25519_keypair_t signing_kp;
+  hs_descriptor_t *desc = NULL;
+  hs_descriptor_t *decoded = NULL;
+  uint8_t subcredential[DIGEST256_LEN];
+  hs_desc_dos_defense_t *def;
+  tor_assert(0 == hs_dos_init_curve());
+
+  (void) arg;
+
+  ret = ed25519_keypair_generate(&signing_kp, 0);
+  tt_int_op(ret, OP_EQ, 0);
+  desc = hs_helper_build_hs_desc_with_ip(&signing_kp);
+
+  {
+    char *encoded = NULL;
+    ret = hs_desc_encode_descriptor(desc, &signing_kp, NULL, &encoded);
+    tt_int_op(ret, OP_EQ, 0);
+    tt_assert(encoded);
+
+    tor_free(encoded);
+  }
+
+  desc->encrypted_data.hs_dos_defenses_enabled = 1;
+  hs_desc_dos_defense_t_free(desc->encrypted_data.hs_dos_defenses);
+  desc->encrypted_data.hs_dos_defenses = hs_desc_dos_defense_t_new();
+  def = desc->encrypted_data.hs_dos_defenses;
+  def->hs_dos_max_token_number = 15;
+  tor_assert(EC_POINT_copy(def->dleq_generator, hs_dos_get_generator()));
+  tor_assert(EC_POINT_copy(def->dleq_public_key, hs_dos_get_generator()));
+  tor_assert(EC_POINT_copy(def->previous_dleq_public_key, hs_dos_get_generator()));
+  tor_assert(EC_POINT_copy(def->previous_generator, hs_dos_get_generator()));
+
+  {
+    char *encoded = NULL;
+
+
+    hs_helper_get_subcred_from_identity_keypair(&signing_kp,
+                                                subcredential);
+
+    ret = hs_desc_encode_descriptor(desc, &signing_kp,
+                                   NULL, &encoded);
+    tt_int_op(ret, OP_EQ, 0);
+    tt_assert(encoded);
+    ret = hs_desc_decode_descriptor(encoded, subcredential, NULL, &decoded);
+    tt_int_op(ret, OP_EQ, 0);
+    tt_assert(decoded);
+
+    hs_helper_desc_equal(desc, decoded);
+
+    tor_free(encoded);
+  }
+ done:
+  hs_dos_terminate_curve();
+  hs_descriptor_free(decoded);
   hs_descriptor_free(desc);
 }
 
@@ -817,6 +881,8 @@ struct testcase_t hs_descriptor[] = {
   { "cert_encoding", test_cert_encoding, TT_FORK,
     NULL, NULL },
   { "encode_descriptor", test_encode_descriptor, TT_FORK,
+    NULL, NULL },
+  { "descriptor_hs_dos", test_descriptor_hs_dos, TT_FORK,
     NULL, NULL },
   { "descriptor_padding", test_descriptor_padding, TT_FORK,
     NULL, NULL },

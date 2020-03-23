@@ -213,6 +213,7 @@ extern struct testcase_t dir_tests[];
 extern struct testcase_t dispatch_tests[];
 extern struct testcase_t dns_tests[];
 extern struct testcase_t dos_tests[];
+extern struct testcase_t hs_dos_tests[];
 extern struct testcase_t entryconn_tests[];
 extern struct testcase_t entrynodes_tests[];
 extern struct testcase_t extorport_tests[];

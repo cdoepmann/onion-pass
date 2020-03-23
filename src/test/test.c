@@ -864,6 +864,7 @@ struct testgroup_t testgroups[] = {
   { "dispatch/", dispatch_tests, },
   { "dns/", dns_tests },
   { "dos/", dos_tests },
+  { "hs_dos/", hs_dos_tests },
   { "entryconn/", entryconn_tests },
   { "entrynodes/", entrynodes_tests },
   { "extorport/", extorport_tests },
