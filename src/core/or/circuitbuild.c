@@ -84,6 +84,12 @@
 #include "feature/nodelist/routerinfo_st.h"
 #include "feature/nodelist/routerstatus_st.h"
 
+#include <sys/resource.h>
+
+/* Evaluation: store values */
+static struct timeval rdv_circ_times[10000];
+static int cur_rdv_circ = 0;
+
 static channel_t * channel_connect_for_circuit(const tor_addr_t *addr,
                                             uint16_t port,
                                             const char *id_digest,
@@ -478,6 +484,7 @@ origin_circuit_init(uint8_t purpose, int flags)
 origin_circuit_t *
 circuit_establish_circuit(uint8_t purpose, extend_info_t *exit_ei, int flags)
 {
+
   origin_circuit_t *circ;
   int err_reason = 0;
   int is_hs_v3_rp_circuit = 0;
@@ -488,10 +495,20 @@ circuit_establish_circuit(uint8_t purpose, extend_info_t *exit_ei, int flags)
 
   circ = origin_circuit_init(purpose, flags);
 
+  struct rusage before_u, after_u;
+  struct timeval result_u, result_s, result;
+  getrusage(RUSAGE_SELF, &before_u);
   if (onion_pick_cpath_exit(circ, exit_ei, is_hs_v3_rp_circuit) < 0 ||
       onion_populate_cpath(circ) < 0) {
     circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_REASON_NOPATH);
     return NULL;
+  }
+  getrusage(RUSAGE_SELF, &after_u);
+  timersub(&after_u.ru_utime, &before_u.ru_utime, &result_u);
+  timersub(&after_u.ru_stime, &before_u.ru_stime, &result_s);
+  timeradd(&result_u, &result_s, &result);
+  if (circ->base_.purpose == CIRCUIT_PURPOSE_S_CONNECT_REND || circ->base_.purpose == CIRCUIT_PURPOSE_S_REND_JOINED){
+    printf("PICK CPATH: %ld\n", result.tv_usec);
   }
 
   circuit_event_status(circ, CIRC_EVENT_LAUNCHED, 0);
@@ -938,6 +955,13 @@ int
 circuit_send_next_onion_skin(origin_circuit_t *circ)
 {
   tor_assert(circ);
+  int ret = -1;
+  struct rusage before_u, after_u;
+  struct timeval result;
+
+  if (circ->base_.purpose == CIRCUIT_PURPOSE_S_CONNECT_REND || circ->base_.purpose == CIRCUIT_PURPOSE_S_REND_JOINED){
+    getrusage(RUSAGE_SELF, &before_u);
+  }
 
   if (circ->cpath->state == CPATH_STATE_CLOSED) {
     /* Case one: we're on the first hop. */
@@ -954,12 +978,43 @@ circuit_send_next_onion_skin(origin_circuit_t *circ)
 
   if (hop) {
     /* Case two: we're on a hop after the first. */
-    return circuit_send_intermediate_onion_skin(circ, hop);
+    ret = circuit_send_intermediate_onion_skin(circ, hop);
+
+    if (circ->base_.purpose == CIRCUIT_PURPOSE_S_CONNECT_REND || circ->base_.purpose == CIRCUIT_PURPOSE_S_REND_JOINED){
+      getrusage(RUSAGE_SELF, &after_u);
+      timersub(&after_u.ru_utime, &before_u.ru_utime, &result);
+      timeradd(&result, &circ->cpu_time_user, &circ->cpu_time_user);
+      timersub(&after_u.ru_stime, &before_u.ru_stime, &result);
+      timeradd(&result, &circ->cpu_time_system, &circ->cpu_time_system);
+    }
+
+    return ret;
   }
 
   /* Case three: the circuit is finished. Do housekeeping tasks on it. */
   circpad_machine_event_circ_built(circ);
-  return circuit_build_no_more_hops(circ);
+  ret = circuit_build_no_more_hops(circ);
+
+  if (circ->base_.purpose == CIRCUIT_PURPOSE_S_CONNECT_REND || circ->base_.purpose == CIRCUIT_PURPOSE_S_REND_JOINED){
+    getrusage(RUSAGE_SELF, &after_u);
+    printf("RDV Circ completed - Onion skin no more hops: chan-id: %ld, circ-id: %u\n", circ->base_.n_chan->global_identifier, circ->base_.n_circ_id);
+    timersub(&after_u.ru_utime, &before_u.ru_utime, &result);
+    timeradd(&result, &circ->cpu_time_user, &circ->cpu_time_user);
+    timersub(&after_u.ru_stime, &before_u.ru_stime, &result);
+    timeradd(&result, &circ->cpu_time_system, &circ->cpu_time_system);
+    printf("User time - sec: %ld, usec: %ld\n", circ->cpu_time_user.tv_sec, circ->cpu_time_user.tv_usec);
+    printf("System time - sec: %ld, usec: %ld\n\n", circ->cpu_time_system.tv_sec, circ->cpu_time_system.tv_usec);
+    timeradd(&circ->cpu_time_user, &circ->cpu_time_system, &rdv_circ_times[cur_rdv_circ]);
+    cur_rdv_circ++;
+    if (cur_rdv_circ%1000 == 0){
+      printf("RDV times - Array print\n");
+      for (int i=0; i< cur_rdv_circ; i++){
+        printf("%ld\n", rdv_circ_times[i].tv_usec);
+      }
+    }
+  }
+
+  return ret;
 }
 
 /**

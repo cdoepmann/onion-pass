@@ -70,6 +70,8 @@
 #include "core/or/origin_circuit_st.h"
 #include "core/or/socks_request_st.h"
 
+#include <sys/resource.h>
+
 STATIC void circuit_expire_old_circuits_clientside(void);
 static void circuit_increment_failure_count(void);
 
@@ -1691,6 +1693,9 @@ circuit_has_opened(origin_circuit_t *circ)
    * to consider its build time. */
   circ->has_opened = 1;
 
+  struct rusage before_u, after_u;
+  struct timeval result;
+
   switch (TO_CIRCUIT(circ)->purpose) {
     case CIRCUIT_PURPOSE_C_ESTABLISH_REND:
       hs_client_circuit_has_opened(circ);
@@ -1720,7 +1725,17 @@ circuit_has_opened(origin_circuit_t *circ)
       break;
     case CIRCUIT_PURPOSE_S_CONNECT_REND:
       /* at the service, connecting to rend point */
+
+      getrusage(RUSAGE_SELF, &before_u);
+
       hs_service_circuit_has_opened(circ);
+
+      getrusage(RUSAGE_SELF, &after_u);
+      timersub(&after_u.ru_utime, &before_u.ru_utime, &result);
+      timeradd(&result, &circ->cpu_time_user, &circ->cpu_time_user);
+      timersub(&after_u.ru_stime, &before_u.ru_stime, &result);
+      timeradd(&result, &circ->cpu_time_system, &circ->cpu_time_system);
+
       break;
     case CIRCUIT_PURPOSE_TESTING:
       circuit_testing_opened(circ);
@@ -2020,6 +2035,8 @@ circuit_should_cannibalize_to_build(uint8_t purpose_to_build,
                                     int has_extend_info,
                                     int onehop_tunnel)
 {
+  /* TODO */
+  // return 0;
 
   /* Do not try to cannibalize if this is a one hop circuit. */
   if (onehop_tunnel) {

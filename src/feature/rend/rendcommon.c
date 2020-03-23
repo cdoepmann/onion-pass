@@ -43,6 +43,8 @@
 #include "feature/rend/rend_service_descriptor_st.h"
 #include "feature/nodelist/routerstatus_st.h"
 
+#include <sys/resource.h>
+
 /** Return 0 if one and two are the same service ids, else -1 or 1 */
 int
 rend_cmp_service_ids(const char *one, const char *two)
@@ -797,8 +799,17 @@ rend_process_relay_cell(circuit_t *circ, const crypt_path_t *layer_hint,
         r = hs_intro_received_introduce1(or_circ,payload,length);
       break;
     case RELAY_COMMAND_INTRODUCE2:
-      if (origin_circ)
+      if (origin_circ){
+        struct rusage before_u, after_u;
+        struct timeval result_u, result_s, result;
+        getrusage(RUSAGE_SELF, &before_u);
         r = hs_service_receive_introduce2(origin_circ,payload,length);
+        getrusage(RUSAGE_SELF, &after_u);
+        timersub(&after_u.ru_utime, &before_u.ru_utime, &result_u);
+        timersub(&after_u.ru_stime, &before_u.ru_stime, &result_s);
+        timeradd(&result_u, &result_s, &result);
+        printf("INTRO2 Handling\n%ld\n", result.tv_usec);
+      }
       break;
     case RELAY_COMMAND_INTRODUCE_ACK:
       if (origin_circ)

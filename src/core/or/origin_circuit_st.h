@@ -76,6 +76,10 @@ enum path_state_t {
 struct origin_circuit_t {
   circuit_t base_;
 
+  /* Variables to keep track of CPU time expended to build this circuit */
+  struct timeval cpu_time_user;
+  struct timeval cpu_time_system;
+
   /** Linked list of AP streams (or EXIT streams if hidden service)
    * associated with this circuit. */
   edge_connection_t *p_streams;

@@ -16,6 +16,8 @@
 #include "core/or/policies.h"
 #include "core/or/relay.h"
 #include "core/or/crypt_path.h"
+#include "core/or/channel.h"
+
 #include "feature/client/circpathbias.h"
 #include "feature/hs/hs_cell.h"
 #include "feature/hs/hs_circuit.h"
@@ -42,6 +44,8 @@
 #include "core/or/crypt_path_st.h"
 #include "feature/nodelist/node_st.h"
 #include "core/or/origin_circuit_st.h"
+
+#include <sys/resource.h>
 
 /* Unsets and frees all variables stored in circ, related to a request
  * or receipt of hs dos tokens */
@@ -538,10 +542,13 @@ launch_rendezvous_point_circuit(const hs_service_t *service,
                                 const hs_service_intro_point_t *ip,
                                 const hs_cell_introduce2_data_t *data)
 {
+
+  struct rusage before_u, after_u;
   int circ_needs_uptime;
   time_t now = time(NULL);
   extend_info_t *info = NULL;
-  origin_circuit_t *circ;
+  origin_circuit_t *circ = NULL;
+  getrusage(RUSAGE_SELF, &before_u);
 
   tor_assert(service);
   tor_assert(ip);
@@ -638,6 +645,12 @@ launch_rendezvous_point_circuit(const hs_service_t *service,
 
  end:
   extend_info_free(info);
+  getrusage(RUSAGE_SELF, &after_u);
+  timersub(&after_u.ru_utime, &before_u.ru_utime, &circ->cpu_time_user);
+  timersub(&after_u.ru_stime, &before_u.ru_stime, &circ->cpu_time_system);
+  struct timeval result;
+  timeradd(&circ->cpu_time_user, &circ->cpu_time_system, &result);
+  printf("circ launch as part of INTRO2 Handling (should be subtracted)\n%ld\n", result.tv_usec);
 }
 
 /* Return true iff the given service rendezvous circuit circ is allowed for a
@@ -1127,7 +1140,7 @@ hs_circ_handle_introduce2(hs_service_t *service,
 {
   int ret = -1;
   time_t elapsed;
-  hs_cell_introduce2_data_t data;
+  hs_cell_introduce2_data_t data = {0};
 
   tor_assert(service);
   tor_assert(circ);
@@ -1185,11 +1198,13 @@ hs_circ_handle_introduce2(hs_service_t *service,
                             "limitations. Ignoring INTRO2 cell");
       tor_free(msg);
     }
+    printf("Rejecting rendezvous circuit construction!\n");
     goto done;
   }
 
   /* Launch rendezvous circuit with the onion key and rend cookie. */
   launch_rendezvous_point_circuit(service, ip, &data);
+
   /* Success. */
   ret = 0;
   

@@ -63,6 +63,8 @@
 #include "trunnel/hs/cell_common.h"
 #include "trunnel/hs/cell_establish_intro.h"
 
+#include <sys/resource.h>
+
 #ifdef HAVE_SYS_STAT_H
 #include <sys/stat.h>
 #endif
@@ -99,6 +101,10 @@ static const char fname_hostname[] = "hostname";
 static const char address_tld[] = "onion";
 static const char fname_dleq_sec_key[] = "dleq_secret_key";
 static const char fname_prev_dleq_sec_key[] = "dleq_previous_secret_key";
+
+/* Evaluation token redemption times */
+static struct timeval tok_redeption[10000];
+static int cur_redemption;
 
 /* Staging list of service object. When configuring service, we add them to
  * this list considered a staging area and they will get added to our global
@@ -4364,13 +4370,53 @@ bool hs_dos_can_launch_rendezvous(hs_service_t *service,
     goto tok_fail;
   }
   tor_assert(handler);
+
+  struct rusage before_u, after_u;
+  struct timeval result_u, result_s;
+
+  getrusage(RUSAGE_SELF, &before_u);
+
   if (hs_dos_redeem_token(
                           redemption_hmac,
                           token_rn,
                           service->onion_address,
                           sizeof(service->onion_address),
-                          handler))
+                          handler)){
+    getrusage(RUSAGE_SELF, &after_u);
+    timersub(&after_u.ru_utime, &before_u.ru_utime, &result_u);
+    timersub(&after_u.ru_stime, &before_u.ru_stime, &result_s);
+    printf("Failure - Redeem Token:\n");
+    printf("User time - sec: %ld, usec: %ld\n", result_u.tv_sec, result_u.tv_usec);
+    printf("System time - sec: %ld, usec: %ld\n", result_s.tv_sec, result_s.tv_usec);
+
+    timeradd(&result_u, &result_s, &tok_redeption[cur_redemption]);
+    cur_redemption++;
+    if (cur_redemption%1000 == 0){
+      printf("Redemption times - Array print\n");
+      for (int i=0; i< cur_redemption; i++){
+        printf("%ld\n", tok_redeption[i].tv_usec);
+      }
+    }
+
     goto tok_fail;
+  }
+
+  getrusage(RUSAGE_SELF, &after_u);
+  timersub(&after_u.ru_utime, &before_u.ru_utime, &result_u);
+  timersub(&after_u.ru_stime, &before_u.ru_stime, &result_s);
+  printf("Redeem Token:\n");
+  printf("User time - sec: %ld, usec: %ld\n", result_u.tv_sec, result_u.tv_usec);
+  printf("System time - sec: %ld, usec: %ld\n", result_s.tv_sec, result_s.tv_usec);
+
+  timeradd(&result_u, &result_s, &tok_redeption[cur_redemption]);
+  cur_redemption++;
+  if (cur_redemption%1000 == 0){
+    printf("Redemption times - Array print\n");
+    for (int i=0; i< cur_redemption; i++){
+      printf("%ld\n", tok_redeption[i].tv_usec);
+    }
+  }
+
   log_info(LD_REND,
         "Successfully validated a token of %s"
         "Launching Rendezvous circuit.", service->onion_address);
