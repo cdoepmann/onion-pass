@@ -15,6 +15,7 @@ LIBTOR_APP_A_SOURCES = 				\
 	src/app/main/shutdown.c			\
 	src/app/main/subsystem_list.c		\
 	src/app/main/subsysmgr.c		\
+	src/core/crypto/hs_dos_crypto.c		\
 	src/core/crypto/hs_ntor.c		\
 	src/core/crypto/onion_crypto.c		\
 	src/core/crypto/onion_fast.c		\
@@ -117,6 +118,7 @@ LIBTOR_APP_A_SOURCES = 				\
 	src/feature/hs/hs_config.c		\
 	src/feature/hs/hs_control.c		\
 	src/feature/hs/hs_descriptor.c		\
+	src/feature/hs/hs_dos.c		\
 	src/feature/hs/hs_ident.c		\
 	src/feature/hs/hs_intropoint.c		\
 	src/feature/hs/hs_service.c		\
@@ -221,6 +223,7 @@ noinst_HEADERS +=					\
 	src/app/main/ntmain.h				\
 	src/app/main/shutdown.h 			\
 	src/app/main/subsysmgr.h			\
+	src/core/crypto/hs_dos_crypto.h			\
 	src/core/crypto/hs_ntor.h			\
 	src/core/crypto/onion_crypto.h	        	\
 	src/core/crypto/onion_fast.h			\
@@ -374,6 +377,7 @@ noinst_HEADERS +=					\
 	src/feature/hs/hs_config.h			\
 	src/feature/hs/hs_control.h			\
 	src/feature/hs/hs_descriptor.h			\
+	src/feature/hs/hs_dos.h			\
 	src/feature/hs/hs_ident.h			\
 	src/feature/hs/hs_intropoint.h			\
 	src/feature/hs/hs_service.h			\
