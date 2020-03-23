@@ -24,6 +24,7 @@ TRUNNELSOURCES = \
 	src/trunnel/hs/cell_establish_intro.c	\
 	src/trunnel/hs/cell_introduce1.c \
 	src/trunnel/hs/cell_rendezvous.c \
+	src/trunnel/hs/cell_token.c \
 	src/trunnel/channelpadding_negotiation.c \
 	src/trunnel/sendme.c                    \
 	src/trunnel/socks5.c \
@@ -41,6 +42,7 @@ TRUNNELHEADERS = \
 	src/trunnel/hs/cell_establish_intro.h	\
 	src/trunnel/hs/cell_introduce1.h \
 	src/trunnel/hs/cell_rendezvous.h \
+	src/trunnel/hs/cell_token.h \
 	src/trunnel/channelpadding_negotiation.h \
 	src/trunnel/sendme.h                    \
 	src/trunnel/socks5.h                    \

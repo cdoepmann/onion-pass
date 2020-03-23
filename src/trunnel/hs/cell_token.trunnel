@@ -1,0 +1,85 @@
+/*
+ * This contains the definition of the TOKEN1/2 cell for onion service
+ * version 3 and onward.
+ */
+
+extern struct trn_cell_extension;
+
+/* HS TOKEN length. */
+const TRUNNEL_HS_TOKEN_LEN = 64;
+/* HS DLEQ PK length. */
+const TRUNNEL_HS_DLEQ_PK_LEN = 64;
+/* HS DLEQ Proof length. */
+const TRUNNEL_HS_DLEQ_PROOF_LEN = 64;
+
+/* The solution to the challenge obtained from the service in the
+ * RENDEZVOUS2 cell and its length */
+struct trn_hs_pow {
+  u8 pow_len;
+  u8 proof_of_work[pow_len];
+};
+
+/* Token, may be signed and unsigned (a point on the elliptic curve) */
+struct trn_hs_token {
+  /* The sequence number of the token */
+  u8 seq_num;
+  u8 token[TRUNNEL_HS_TOKEN_LEN];
+};
+
+/* DLEQ public key (a point on the elliptic curve) */
+struct trn_dleq_pk {
+  u8 dleq_pk[TRUNNEL_HS_DLEQ_PK_LEN];
+};
+
+/* Token, may be signed and unsigned */
+struct trn_dleq_proof {
+  u8 dleq_proof[TRUNNEL_HS_DLEQ_PROOF_LEN];
+};
+
+/* TOKEN1 payload. */
+struct trn_cell_token1 {
+  /* We use this boolean to indicate whether it is the first TOKEN1 cell
+   * with tokens we want to be signed. It initiates the process of sending
+   * signable tokens. */
+  u8 first_cell;
+  /* We use this boolean to indicate whether it is the last TOKEN1 cell
+   * with tokens we want to be signed. */
+  u8 last_cell;
+  /* The solution to the challenge obtained from the service in the
+   * RENDEZVOUS2 cell */
+  struct trn_hs_pow pow[first_cell];
+  /* The number of tokens to be signed in this batch */
+  u8 batch_size[first_cell];
+
+  /* Extension(s). Reserved fields. */
+  struct trn_cell_extension extensions;
+
+  /* The number of tokens int this particular cell */
+  u8 token_num;
+  /* The actual tokens */
+  struct trn_hs_token tokens[token_num];
+};
+
+/* TOKEN2 payload. */
+struct trn_cell_token2 {
+  /* We use this boolean to indicate whether it is the first TOKEN2 cell
+   * with tokens we have signed. It initiates the process of sending
+   * signed tokens. */
+  u8 first_cell;
+  /* We use this boolean to indicate whether it is the last TOKEN1 cell
+   * with tokens we have signed. */
+  u8 last_cell;
+  /* The Public key used to create the signature. */
+  struct trn_dleq_pk dleq_pk[first_cell];
+  /* The actual DLEQ proof is only sent in the first cell. */
+  struct trn_dleq_proof dleq_proof[first_cell];
+  /* The number of tokens to be signed in this batch */
+  u8 batch_size[first_cell];
+  /* Extension(s). Reserved fields. */
+  struct trn_cell_extension extensions;
+  
+  /* The number of tokens int this particular cell */
+  u8 token_num;
+  /* The actual tokens */
+  struct trn_hs_token tokens[token_num];
+};

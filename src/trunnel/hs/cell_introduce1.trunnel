@@ -73,3 +73,23 @@ struct trn_cell_introduce_encrypted {
   /* Optional padding. This might be empty or not. */
   u8 pad[];
 };
+
+
+/*
+ * INTRODUCE1/INTRODUCE2 cell extensions.
+ */
+
+const TRUNNEL_CELL_EXTENSION_TYPE_HS_DOS = 0x01;
+
+const TRUNNEL_CELL_EXTENSION_HS_DOS_DLEQ_PK_LEN = 64;
+const TRUNNEL_CELL_EXTENSION_HS_DOS_TOKEN_LEN = 32;
+const TRUNNEL_CELL_EXTENSION_HS_DOS_MAC_LEN = 32;
+
+/*
+ * HS DoS Token Extension.
+ */
+struct trn_cell_extension_hs_dos {
+  u8 pub_key[TRUNNEL_CELL_EXTENSION_HS_DOS_DLEQ_PK_LEN];
+  u8 token[TRUNNEL_CELL_EXTENSION_HS_DOS_TOKEN_LEN];
+  u8 redemption_mac[TRUNNEL_CELL_EXTENSION_HS_DOS_MAC_LEN];
+};
